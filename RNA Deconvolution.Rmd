@@ -1,0 +1,1108 @@
+---
+title: "RNA Deconvolution"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r}
+library(data.table)
+library(dplyr)
+library(ggrepel)
+library(ggplot2)
+library(readr)
+library(stringr)
+library(tidyr)
+library(ggVennDiagram)
+library(readxl)
+library(tibble)
+library(edgeR)
+library(matrixStats)
+library(biomaRt)
+library(glmmTMB)
+library(emmeans)
+library(ggpubr)
+library(ggeffects)
+library(svglite)
+```
+
+# load GTEx
+
+```{r}
+setwd("/Users/cindywang/Desktop/Kramer/P10GTEx_raw")
+
+# load data 
+gtex_counts <- read.delim("gene_reads_2017-06-05_v8_brain_spinal_cord_cervical_c-1.gct.gz", skip = 2)
+gtex_meta<-read.table("GTEx_Analysis_v10_Annotations_SubjectPhenotypesDS.txt", sep = "\t", header = TRUE)
+gtex_v10_meta <- read_tsv(
+  "GTEx_Analysis_v10_Annotations_SampleAttributesDS.txt",
+  quote = "",            # ignore quotes so they don't swallow tabs
+  comment = "",          # don't treat # as comments
+  progress = FALSE,
+  show_col_types = FALSE)
+
+# remove gene name and empty column 
+gtex_counts<- gtex_counts %>%
+  dplyr::select(-1, -3) %>%
+  dplyr::rename(Ensembl = Name)
+
+#clean metadata  
+#1. remove hardy scale 2. convert 1=male 2=female 3. convert age range to mid point 
+gtex_meta <- gtex_meta %>%
+  dplyr::select(-4) %>%
+  dplyr::mutate(
+    sex = dplyr::recode(
+      as.character(SEX),
+      "1" = "Male",
+      "2" = "Female"
+    ),
+    age_mid = dplyr::recode(
+      as.character(AGE),
+      "20-29" = "25",
+      "30-39" = "35",
+      "40-49" = "45",
+      "50-59" = "55",
+      "60-69" = "65",
+      "70-79" = "75"
+    )
+  ) %>%
+  dplyr::select(-SEX, -AGE)
+
+#Extract donor IDs from spinal cord sample columns
+spinal_sample_ids <- colnames(gtex_counts)[2:ncol(gtex_counts)]
+spinal_sample_ids <- gsub("\\.", "-", spinal_sample_ids) # Convert sample IDs from R-safe format back to GTEx format
+spinal_donor_ids <- substr(spinal_sample_ids, 1, 10) # Extract donor IDs from sample IDs
+spinal_donor_ids <- stringr::str_remove(spinal_donor_ids, "-$") # Remove trailing dash if present
+
+#Filter subject metadata to spinal cord donors
+subject_meta <- gtex_meta %>%
+  dplyr::filter(SUBJID %in% spinal_donor_ids)
+nrow(subject_meta) #159 
+
+#filter everything meta to spinal cord donors 
+v10_meta <- gtex_v10_meta %>%
+  dplyr::filter(SAMPID %in% spinal_sample_ids)
+nrow(v10_meta) #159 
+
+#create a "donor ID" column in everything meta 
+v10_meta$SUBJID<- substr(v10_meta$SAMPID, 1, 10)
+strip_trailing_dash <- function(x) {
+  x <- trimws(x)
+  sub("-$", "", x)   
+}
+v10_meta$SUBJID<-strip_trailing_dash(v10_meta$SUBJID)
+
+#merge 2 metadata  
+GTEx_meta<-merge(v10_meta,subject_meta,by="SUBJID",all.x=TRUE)
+
+#check ensembl ID duplicates 
+dup_row<-gtex_counts %>%
+  group_by(Ensembl) %>% 
+  filter(n() > 1)
+dup_row #no dup in ensembl ID 
+
+#rename the collection sites 
+GTEx_meta <- GTEx_meta %>%
+  mutate(SMCENTER = case_when(
+    SMCENTER == "B1, A1" ~ "GTEx B1, A1",
+    SMCENTER == "C1, A1" ~ "GTEx C1, A1",
+    SMCENTER == "C1, B1, A1" ~ "GTEx C1, B1, A1",
+    SMCENTER == "D1, A1" ~ "GTEx D1, A1",
+    TRUE ~ SMCENTER
+  ))
+
+```
+
+
+# load NYGC 
+
+```{r}
+setwd("/Users/cindywang/Desktop/Kramer/P9ALS/Humphrey data")
+#import count data
+cervical_counts <- read.table("Cervical_Spinal_Cord_gene_counts.tsv", header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+thoracic_counts <- read.table("Thoracic_Spinal_Cord_gene_counts.tsv", header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+lumbar_counts <- read.table("Lumbar_Spinal_Cord_gene_counts.tsv", header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+
+#import metadata
+lumbar_meta<-read.table("Lumbar_Spinal_Cord_metadata.tsv", header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+cerv_meta<-read.table("Cervical_Spinal_Cord_metadata.tsv", header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+thoracic_meta<-read.table("Thoracic_Spinal_Cord_metadata.tsv", header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+
+#filter for controls in meta 
+lumbar_meta<-lumbar_meta %>%  filter(disease=="Control")
+cerv_meta<-cerv_meta %>%  filter(disease=="Control")
+thoracic_meta<-thoracic_meta %>%  filter(disease=="Control")
+
+#combine all metadata 
+NYGC_meta<-rbind(lumbar_meta,cerv_meta,thoracic_meta)
+
+#rename site in metadata 
+NYGC_meta <- NYGC_meta %>%
+  mutate(site_id = case_when(
+    site_id == "site_1" ~ "NYGC site 1",
+    site_id == "site_2" ~ "NYGC site 2",
+    site_id == "site_3" ~ "NYGC site 3",
+    site_id == "site_4" ~ "NYGC site 4",
+    site_id == "site_5" ~ "NYGC site 5",
+    site_id == "site_6" ~ "NYGC site 6",
+    site_id == "site_7" ~ "NYGC site 7",
+    site_id == "site_8" ~ "NYGC site 8",
+    TRUE ~ site_id
+  ))
+
+#filter for controls in count data, keep ensembl only 
+cervical_counts <- cervical_counts[, c(names(cervical_counts)[1], cerv_meta$rna_id)]
+thoracic_counts <- thoracic_counts[, c(names(thoracic_counts)[1],thoracic_meta$rna_id)]
+lumbar_counts <- lumbar_counts[, c(names(lumbar_counts)[1],lumbar_meta$rna_id)]
+
+#merge count data 
+a<-merge(cervical_counts,thoracic_counts,by="ensembl_id")
+NYGC_counts<-merge(a,lumbar_counts,by="ensembl_id")
+dim(NYGC_counts) # 58884    81
+
+#check ensembl ID duplicates 
+dup_row<-NYGC_counts %>%
+  group_by(ensembl_id) %>% 
+  filter(n() > 1)
+dup_row # no dup
+
+```
+
+# load Genentech 
+
+```{r}
+setwd("/Users/cindywang/Desktop/Kramer/P13MoreBulk")
+
+HF40651<-read_tsv("GSE255683/GSM8077424_SAM24436421_NXG14799307.counts_gene_exonic.tab.gz") %>%
+  dplyr::select(-width,-rpkm) %>%
+  dplyr::rename(HF40651=count)
+HF40655<-read_tsv("GSE255683/GSM8077425_SAM24436422_NXG14799324.counts_gene_exonic.tab.gz") %>%
+  dplyr::select(-width,-rpkm) %>%
+  dplyr::rename(HF40655=count)
+HF43950<-read_tsv("GSE255683/GSM8077426_SAM24436423_NXG14799319.counts_gene_exonic.tab.gz") %>%
+  dplyr::select(-width,-rpkm) %>%
+  dplyr::rename(HF43950=count)
+HF43959<-read_tsv("GSE255683/GSM8077427_SAM24436424_NXG14799320.counts_gene_exonic.tab.gz") %>%
+  dplyr::select(-width,-rpkm) %>%
+  dplyr::rename(HF43959=count)
+HF43960<-read_tsv("GSE255683/GSM8077428_SAM24436425_NXG14799312.counts_gene_exonic.tab.gz") %>%
+  dplyr::select(-width,-rpkm) %>%
+  dplyr::rename(HF43960=count)
+HF46773<-read_tsv("GSE255683/GSM8077429_SAM24436426_NXG14799323.counts_gene_exonic.tab.gz") %>%
+  dplyr::select(-width,-rpkm) %>%
+  dplyr::rename(HF46773=count)
+HF46775<-read_tsv("GSE255683/GSM8077430_SAM24436427_NXG14799316.counts_gene_exonic.tab.gz") %>%
+  dplyr::select(-width,-rpkm) %>%
+  dplyr::rename(HF46775=count)
+HF32327<-read_tsv("GSE255683/GSM8077431_SAM24436428_NXG14799321.counts_gene_exonic.tab.gz") %>%
+  dplyr::select(-width,-rpkm) %>%
+  dplyr::rename(HF32327=count)
+HF39053<-read_tsv("GSE255683/GSM8077432_SAM24436429_NXG14799315.counts_gene_exonic.tab.gz") %>%
+  dplyr::select(-width,-rpkm) %>%
+  dplyr::rename(HF39053=count)
+HF37902<-read_tsv("GSE255683/GSM8077433_SAM24436430_NXG14799310.counts_gene_exonic.tab.gz") %>%
+  dplyr::select(-width,-rpkm) %>%
+  dplyr::rename(HF37902=count)
+
+#merge data frames by "name"
+df_list<-list(HF40651, HF40655, HF43950, HF43959, HF43960, HF46773, HF46775, HF32327, HF39053, HF37902)
+
+df_list <- lapply(df_list, function(df) {
+  df$name <- as.character(df$name)
+  df
+})
+
+Genentech_count <- Reduce(function(x, y) left_join(x, y, by = "name"), df_list)
+#dim 58302 11 
+
+#metadata 
+setwd("/Users/cindywang/Desktop/Kramer/P13MoreBulk")
+genentech_meta<-read_excel("GSE255683/meta.xlsx")
+genentech_meta<-genentech_meta[c(11:20),c(1,3,4)]
+
+#rewrite M/F into male/female 
+genentech_meta <- genentech_meta %>%
+  mutate(Sex = case_when(
+    Sex == "F" ~ "Female",
+    Sex == "M" ~ "Male",
+    TRUE ~ Sex
+  ))
+
+#remove the dash in the specimen names 
+genentech_meta <- genentech_meta %>%
+  mutate(Specimen = str_remove_all(Specimen, "-"))
+
+```
+
+#combine meta 
+
+```{r}
+GTEx_partialmeta<-GTEx_meta[,c("SAMPID","SUBJID","SMCENTER","SMRIN","age_mid","sex")]
+NYGC_partialmeta<-NYGC_meta[,c("rna_id","dna_id","site_id","tissue","age_rounded","sex","rin")]
+Genentech_partialmeta<-genentech_meta[,c("Specimen","Sex","Age at Collection")]
+
+#create missing columns
+GTEx_partialmeta$level<-rep("Cervical_Spinal_Cord",159) #create level column for GTEx
+Genentech_partialmeta$level<-rep("Lumbar_Spinal_Cord",10) #create level column for Genentech
+Genentech_partialmeta$donor<-genentech_meta$Specimen #create donor column for Genentech
+Genentech_partialmeta$site<-rep("Genentech",10) #create collection site 
+Genentech_partialmeta$RIN <- NA #create RIN 
+GTEx_partialmeta$source<-rep("GTEx",159) 
+NYGC_partialmeta$source<-rep("NYGC",80) 
+Genentech_partialmeta$source<-rep("Genentech",10) 
+
+#reorder
+GTEx_partialmeta <- GTEx_partialmeta[, c("SAMPID","SUBJID","SMCENTER","SMRIN","level","age_mid","sex","source")]
+NYGC_partialmeta<-NYGC_partialmeta[,c("rna_id","dna_id","site_id","rin","tissue","age_rounded","sex","source")]
+Genentech_partialmeta<-Genentech_partialmeta[,c("Specimen","donor","site","RIN","level","Age at Collection","Sex","source")]
+    
+#rename 
+colnames(GTEx_partialmeta)<-c("sample","donor","site","RIN","level","age","sex","source")  
+colnames(NYGC_partialmeta)<-c("sample","donor","site","RIN","level","age","sex","source")   
+colnames(Genentech_partialmeta)<-c("sample","donor","site","RIN","level","age","sex","source")  
+                           
+#sanity check 
+identical(colnames(GTEx_partialmeta),colnames(NYGC_partialmeta))
+identical(colnames(GTEx_partialmeta),colnames(Genentech_partialmeta))
+
+#merge 
+merge_meta<-rbind(GTEx_partialmeta,NYGC_partialmeta)
+merge_meta<-rbind(merge_meta,Genentech_partialmeta)
+dim(merge_meta) #249 8
+
+# setwd("/Users/cindywang/Desktop/Kramer/Publication")
+# write.csv(merge_meta, "merge_meta.csv", row.names = FALSE)
+```
+
+#combine count 
+
+```{r}
+dim(gtex_counts) #56200   160
+dim(NYGC_counts) #58884    81
+dim(Genentech_count) #58302    11
+
+# Rename the columns 
+NYGC_counts<-NYGC_counts %>%
+  dplyr::rename(Ensembl=ensembl_id)
+
+Genentech_count<-Genentech_count %>%
+  dplyr::rename(Ensembl=name)
+
+############ GTEx processing ############
+# remove the Y-chromosome PAR (pseudoautosomal region) annotations (n=44)
+gtex_counts <- gtex_counts %>%
+  filter(!str_ends(Ensembl, "_PAR_Y"))
+
+# remove the ensembl version in GTEx 
+gtex_counts <- gtex_counts %>%
+  mutate(Ensembl = str_remove(Ensembl, "\\..*$"))
+
+# check dups 
+dup_row<-gtex_counts %>%
+  group_by(Ensembl) %>% 
+  filter(n() > 1)
+dup_row # no dup
+
+# Venn 
+venndiagram <- ggVennDiagram(
+  x = list(
+    GTEx       = gtex_counts$Ensembl,
+    NYGC       = NYGC_counts$Ensembl,
+    Genentech  = Genentech_count$Ensembl
+  ))
+
+# ggsave(
+#   filename = "venn_diagram.svg",
+#   plot = venndiagram,
+#   device = svglite::svglite,
+#   width = 7,
+#   height = 6,
+#   units = "in",
+#   bg = "white"
+# )
+
+# find overlap 
+overlap <- intersect(intersect(gtex_counts$Ensembl, NYGC_counts$Ensembl),
+                     Genentech_count$Ensembl)
+
+# filter for overlap
+gtex_common <- gtex_counts %>%
+  filter(Ensembl %in% overlap)
+
+nygc_common <- NYGC_counts %>%
+  filter(Ensembl %in% overlap)
+
+genentech_common <- Genentech_count %>%
+  filter(Ensembl %in% overlap)
+
+# merge counts 
+merge_counts <- gtex_common %>%
+  inner_join(nygc_common, by = "Ensembl") %>%
+  inner_join(genentech_common, by = "Ensembl") 
+# 55740   250
+
+# setwd("/Users/cindywang/Desktop/Kramer/Publication")
+# write.csv(merge_counts, "merge_counts_ensembl.csv", row.names = TRUE)
+```
+# Demographic info 
+
+```{r}
+# change level to abbrev 
+merge_meta$level <- recode(
+  merge_meta$level,
+  "Cervical_Spinal_Cord" = "Cervical",
+  "Thoracic_Spinal_Cord" = "Thoracic",
+  "Lumbar_Spinal_Cord" = "Lumbar"
+)
+
+# age distribution by sex 
+merge_meta$level <- factor(
+  merge_meta$level,
+  levels = c("Cervical", "Thoracic", "Lumbar")
+)
+
+ggplot(merge_meta, aes(x = age, fill = level)) +
+  geom_histogram(
+    binwidth = 10,
+    boundary = 0,
+    position = "dodge",
+    color = "white"
+  ) +
+  scale_fill_manual(
+    limits = c("Cervical", "Thoracic", "Lumbar"),
+    values = c(
+      "Cervical" = "#F28E2B",  # orange
+      "Thoracic" = "#FFE699",  # light yellow
+      "Lumbar"   = "#4E79A7"   # blue
+    )
+  ) +
+  scale_x_continuous(breaks = seq(0, 100, by = 10)) +
+  labs(
+    x = "Age",
+    y = "Count",
+    fill = "Level"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_text(size = 20, face = "bold"),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 15),
+    legend.title = element_text(size = 17),
+    legend.text = element_text(size = 15))
+
+ggsave(
+  "age x level.svg",
+  device = svglite,
+  width = 8,
+  height = 3
+)
+
+# age distribution by level 
+ggplot(merge_meta, aes(x = age, fill = sex)) +
+  geom_histogram(
+    binwidth = 10,
+    boundary = 0,
+    position = "dodge",
+    color = "white"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Male" = "darkgreen",  
+      "Female" = "purple"
+    )
+  ) +
+  scale_x_continuous(breaks = seq(0, 100, by = 10)) +
+  labs(
+    x = "Age",
+    y = "Count",
+    fill = "Sex"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_text(size = 20, face = "bold"),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 15),
+    legend.title = element_text(size = 17),
+    legend.text = element_text(size = 15))
+
+ggsave(
+  "age x sex.svg",
+  device = svglite,
+  width = 8,
+  height = 3
+)
+
+```
+
+# Filter lowly expressed genes 
+
+```{r}
+#load dataset 
+setwd("/Users/cindywang/Desktop/Kramer/Publication")
+merge_counts<-read.csv("merge_counts_ensembl.csv",header=TRUE,row.names=1)
+merge_meta<-read.csv("merge_meta.csv",header=TRUE)
+
+# column to rownames 
+a<-merge_counts %>%
+  column_to_rownames("Ensembl")
+
+# CPM transformation
+cpm <- cpm(a)
+cpm_adjusted = as.data.frame(cpm)
+
+#make sure each variable are of the correct type 
+all3_meta <- merge_meta %>%
+  mutate(
+    across(c(source,level,sex,site), as.factor),
+    across(c(age),as.numeric),
+    across(c(sample, donor), ~ str_trim(as.character(.)))
+  )
+
+# drop gene if CPM is missing in 80% or greater of the participants
+sampleNumber <- ncol(cpm_adjusted) #249 samples
+keep=rowSums(cpm_adjusted >0) >= sampleNumber*0.2
+all3_counts = cpm_adjusted[keep,] 
+dim(all3_counts)
+#33197   249
+```
+
+
+# PCA
+
+```{r}
+colnames(all3_counts) <- str_trim(as.character(colnames(all3_counts)))
+
+#align columns of count matrix with metadata samples
+colnames(all3_counts)<-gsub("\\.","-",colnames(all3_counts))
+all3_meta<-all3_meta[match(colnames(all3_counts),all3_meta$sample),]
+all(colnames(all3_counts)==all3_meta$sample) #TRUE
+
+############ PCA pre ############
+dge <- DGEList(counts = all3_counts)
+
+# filter lowly expressed genes
+keep <- rowSums(cpm(dge) >= 5) >= 3
+dge  <- dge[keep, , keep.lib.sizes = FALSE]
+
+# TMM normalization
+dge <- calcNormFactors(dge)
+
+# logCPM
+logcpm <- cpm(dge, log = TRUE, prior.count = 1)
+
+# select top variable genes
+ntop <- min(5000, nrow(logcpm))
+top  <- head(order(rowVars(logcpm), decreasing = TRUE), ntop)
+
+# PCA
+pc <- prcomp(t(logcpm[top, ]), scale. = TRUE)
+
+scores <- as.data.frame(pc$x) |>
+  rownames_to_column("sample") |>
+  left_join(all3_meta, by = "sample")
+
+#plot 
+ggplot(scores, aes(PC1, PC2, color = source)) +
+  geom_point(size = 3, alpha = 0.9) +
+  labs(
+    title = "PCA (logCPM, TMM-normalized)",
+    x = sprintf("PC1 (%.2f%%)", 100 * summary(pc)$importance[2,1]),
+    y = sprintf("PC2 (%.2f%%)", 100 * summary(pc)$importance[2,2])
+  ) +
+  theme_minimal()+
+  theme(
+      legend.title = element_text(size = 18),
+      legend.text  = element_text(size = 18),
+      axis.title.x = element_text(size = 18),
+      axis.title.y = element_text(size = 18))
+# ggsave("3Combined PCA_prebatch_source.png",width=10,height=8,unit="in",dpi = 300)
+
+
+############ combat-seq ############
+#sanity check 
+all(colnames(all3_counts)==all3_meta$sample) #true
+
+#create a batch variable 
+batch<-factor(all3_meta$source)
+
+#model matrix for biological covars to preserve
+covar_mod <- model.matrix(~ level + sex + age, data = all3_meta)
+
+# 4. ComBat-seq
+combat_counts <- sva::ComBat_seq(
+  as.matrix(all3_counts),
+  batch     = batch,
+  covar_mod = covar_mod
+)
+
+
+############ PCA post ############
+all(colnames(combat_counts)==all3_meta$sample) #TRUE
+
+# Make DGEList from batch-corrected counts
+dge_c <- DGEList(counts = combat_counts)
+
+# Filter lowly expressed genes (same rule as before)
+keep_c <- rowSums(cpm(dge_c) >= 5) >= 3
+dge_c  <- dge_c[keep_c, , keep.lib.sizes = FALSE]
+
+# TMM normalize
+dge_c <- calcNormFactors(dge_c)
+
+# logCPM
+logcpm_c <- cpm(dge_c, log = TRUE, prior.count = 1)
+
+# Top variable genes
+ntop <- min(5000, nrow(logcpm_c))
+top  <- head(order(rowVars(logcpm_c), decreasing = TRUE), ntop)
+
+# PCA on samples
+pc_c <- prcomp(t(logcpm_c[top, ]), center = TRUE, scale. = TRUE)
+
+# Variance %
+pc_var_pct <- round(100 * (pc_c$sdev^2 / sum(pc_c$sdev^2)), 2)
+
+scores_c <- as.data.frame(pc_c$x) %>%
+  tibble::rownames_to_column("sample") %>%
+  left_join(all3_meta, by = "sample")
+
+ggplot(scores_c, aes(PC1, PC2, color = level)) +
+  geom_point(size = 3, alpha = 0.9) +
+  labs(
+    title = "PCA (After ComBat-seq)",
+    x = sprintf("PC1 (%.2f%%)", pc_var_pct[1]),
+    y = sprintf("PC2 (%.2f%%)", pc_var_pct[2]),
+    color = "source"
+  ) +
+  theme_minimal()+
+  theme(
+      legend.title = element_text(size = 18),
+      legend.text  = element_text(size = 18),
+      axis.title.x = element_text(size = 18),
+      axis.title.y = element_text(size = 18))
+# ggsave("3Combined PCA_afterbatch_source.png",width=10,height=8,unit="in",dpi = 300)
+
+
+#combined before and after plots
+scores$stage   <- factor("Before ComBat-seq",
+                          levels = c("Before ComBat-seq", "After ComBat-seq"))
+scores_c$stage <- factor("After ComBat-seq",
+                          levels = c("Before ComBat-seq", "After ComBat-seq"))
+
+both <- bind_rows(scores, scores_c)
+
+ggplot(both, aes(PC1, PC2, color = source)) +
+  geom_point(size = 3, alpha = 0.9) +
+  facet_wrap(~stage,nrow=1) +
+  theme_bw()+
+  theme(
+      strip.text = element_text(size = 24),
+      legend.title = element_text(size = 20),
+      legend.text  = element_text(size = 20),
+      axis.title = element_text(size = 20),
+      axis.text = element_text(size=20))
+# ggsave("CombinedPCA_source.png",width=16,height=8,unit="in",dpi = 300)
+```
+# ENSEMBL to gene name 
+
+```{r}
+# rownames back to column "ENSEMBL"
+combat_counts <- as.data.frame(combat_counts) %>%
+  rownames_to_column(var = "ENSEMBL")
+
+# Connect to Ensembl
+mart <- useEnsembl(
+  biomart = "genes",
+  dataset = "hsapiens_gene_ensembl"
+)
+
+# Query Ensembl
+gene_map <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  filters = "ensembl_gene_id",
+  values = combat_counts$ENSEMBL,
+  mart = mart
+)
+
+# Rename columns
+colnames(gene_map) <- c("ENSEMBL", "HGNC")
+# only 32506 out of 33197 genes have HGNC symbols
+
+# Merge into original dataframe
+combat_counts_genename <- combat_counts %>%
+  left_join(gene_map, by = "ENSEMBL") 
+
+# Remove empty string ("") or NA
+combat_counts_genename <- combat_counts_genename  %>% 
+  filter(!is.na(HGNC), HGNC != "")
+dim(combat_counts_genename) # 26587   251
+
+```
+
+
+#CIBERSORTx pre-deconvolution preprocessing 
+
+```{r}
+#check duplicated gene names 
+dup_row<-combat_counts_genename1 %>%
+  group_by(HGNC) %>% 
+  filter(n() > 1)
+dup_row #1 duplicated gene name: GOLGA8M
+
+#compute average of duplicated genes 
+combat_counts_genename1 <- combat_counts_genename %>%
+  group_by(HGNC) %>%
+  summarise(
+    across(where(is.numeric), ~ mean(.x, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# sanity check 
+anyDuplicated(combat_counts_genename1$HGNC) == 0
+
+#column to row, drop ENSEMBL column 
+Deconv_data <- combat_counts_genename1 %>%
+  dplyr::select(HGNC, everything()) %>%
+  column_to_rownames("HGNC")
+
+#save as txt
+write.table(a, file = "Publication_inc_noncoding.txt", sep = "\t", row.names = TRUE, col.names = TRUE)
+
+a <-read.table("Publication_inc_noncoding.txt", header = TRUE, sep = "\t", row.names = 1)
+
+a<-a %>%
+  rownames_to_column()
+getwd(
+)
+```
+
+#Data Viz
+
+```{r}
+library(ggbreak)
+#load data 
+all3_meta<-read.csv("merge_meta.csv")
+final_prop<-read.csv("CIBERSORTx_Job60_Results.csv") #mid-level, filtered bulk, permutation 100, porportion, ENSEMBL to gene name  
+final_abd<-read.csv("CIBERSORTx_Job61_Results.csv") #mid-level, filtered bulk, permutation 100, abundance, ENSEMBL to gene name  
+
+#proportional barplot for each cell type 
+#pivot longer 
+Deconv_long<-pivot_longer(
+  final_prop,
+  cols=Motoneurons:Lymphocytes,
+  names_to="cell_type",
+  values_to="proportion")
+
+Summary <- Deconv_long %>%
+  group_by(cell_type) %>%
+  summarise(
+    average = mean(proportion),
+    sd = sd(proportion),
+    n = n()
+  ) %>%
+  mutate(
+    average = average * 100,
+    sd = sd * 100,
+    sem = sd / sqrt(n)
+  ) %>%
+  arrange(desc(average))
+
+# save plot 
+p<-ggplot(Summary, aes(x = reorder(cell_type, average), y = average)) +
+  geom_col(fill = "skyblue") +
+  geom_errorbar(
+    aes(ymin = average - sem, ymax = average + sem),  
+    size = 0.8,
+    width = 0.3
+  ) +
+  geom_text(
+    aes(label = round(average, 3)),
+    hjust = -1,
+    size = 5
+  ) +
+  coord_flip() +
+  labs(
+    x = "Cell Types",
+    y = "Proportion",
+    title = "CIBERSORTx Mid-Level Cell Type Proportion"
+  ) +
+  scale_y_break(c(15, 65), scales = 0.5) +
+  scale_y_continuous(
+    breaks = c(0, 5, 10, 15, 65, 76, 79),
+    labels = c(0, 5, 10, 15, 65, 76, 79)
+  ) +
+  theme_minimal() +
+  theme(
+    legend.title = element_text(size = 18),
+    legend.text  = element_text(size = 18),
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_text(size = 18),
+    axis.text    = element_text(size = 18),
+    panel.grid = element_blank()
+  )
+
+svglite("Deconv_proportion.svg", width = 10, height = 10, standalone = TRUE, fix_text_size = TRUE)
+print(p)
+dev.off()
+
+
+# QC 
+setwd("/Users/cindywang/Desktop/Kramer/P13MoreBulk")
+#check RMSE distribution 
+ggplot(final_prop,aes(x=RMSE))+
+  geom_histogram(binwidth=0.005,fill="grey",color="black")+
+  labs(title="Distribution of RMSE",
+       x="RMSE",
+       y="Count")+
+  theme_minimal()+
+  theme(
+      legend.title = element_text(size = 18),
+      legend.text  = element_text(size = 18),
+      axis.title.x = element_text(size = 18),
+      axis.title.y = element_text(size = 18)
+    )
+# ggsave("RMSE Distribution.png",width=10,height=4,unit="in",dpi = 300)
+
+#check correlation distribution 
+ggplot(final_prop,aes(x=Correlation))+
+  geom_histogram(binwidth=0.005,fill="grey",color="black")+
+  labs(title="Distribution of Correlation",
+       x="Correlation",
+       y="Count")+
+  theme_minimal()+
+  theme(
+      legend.title = element_text(size = 18),
+      legend.text  = element_text(size = 18),
+      axis.title.x = element_text(size = 18),
+      axis.title.y = element_text(size = 18)
+    )
+# ggsave("Correlation Distribution.png",width=10,height=4,unit="in",dpi = 300)
+
+# check p value distribution 
+ggplot(final_prop,aes(x=P.value))+
+  geom_histogram(binwidth=0.0001,fill="grey",color="black")+
+  labs(title="Distribution of P values",
+       x="P Value",
+       y="Count")+
+  theme_minimal()+
+  theme(
+      legend.title = element_text(size = 18),
+      legend.text  = element_text(size = 18),
+      axis.title.x = element_text(size = 18),
+      axis.title.y = element_text(size = 18)
+    )
+# ggsave("P value Distribution.png",width=10,height=4,unit="in",dpi = 300)
+
+```
+
+#Data cleanup 
+
+```{r}
+#change the dots into dashes in the sample names
+final_abd$Mixture <- gsub("\\.", "-", final_abd$Mixture)
+
+#reorder the 2 donor id columns to match
+final_abd<-final_abd[match(all3_meta$sample,final_abd$Mixture),]
+all(final_abd$Mixture==all3_meta$sample) #TRUE
+
+# keep cells with mean proportions >=1%
+celltypes <- final_prop %>%
+  dplyr::select(-Mixture) %>%
+  summarise(across(everything(), mean)) %>%
+  pivot_longer(everything(), names_to = "cell_type", values_to = "mean_prop") %>%
+  filter(mean_prop >= 0.01) %>%
+  pull(cell_type)
+celltypes<-celltypes[1:6]
+#"Motoneurons"     "Astrocyte"      "Macrophages"     "Microglia"      "Oligodendrocyte" "Endothelial"    
+
+final_abd_filt<-final_abd%>%
+  dplyr::select(Mixture, Oligodendrocyte,Astrocyte,Endothelial,Motoneurons, Microglia, Macrophages)%>%
+  dplyr::select(-any_of(c("RMSE","Correlation")))
+# 249   7
+
+#combine columns 
+data<-left_join(final_abd_filt,all3_meta,by=c("Mixture"="sample"))
+
+#specify the data types 
+data<-data%>%
+  mutate(
+    across(c(sex,level,donor,source),as.factor),
+    across(c(age,RIN),as.numeric))
+# 249 * 14 
+```
+
+# Check Distribution
+
+```{r}
+#check distribution of each cell type using facet wrap
+par(mfrow=c(2,3))
+
+final_longer<-final_abd_filt %>%
+  dplyr::select(-Mixture) %>%
+  pivot_longer(
+  cols=everything(),
+  names_to = "cell_type",
+  values_to = "abundance"
+)
+
+ggplot(final_longer,aes(x=abundance))+
+  geom_histogram(binwidth=0.1,fill="lightblue",color="black")+
+  labs(title="Distribution", x="Absolute Abundance",y="Count")+
+  facet_wrap(~cell_type,scales="free")+
+  theme_classic()+
+  theme(
+      legend.title = element_text(size = 16),
+      legend.text  = element_text(size = 16),
+      axis.title = element_text(size = 16),
+      strip.text = element_text(size=16)
+    )
+# setwd("/Users/cindywang/Desktop/Kramer/Publication/Figures")
+# ggsave("Cell Type Distribution.png",width=12,height=8,unit="in",dpi = 300)
+
+#Compute the percentage of zeros in each cell type 
+zero_percentages <- sapply(final_abd_filt[-1], function(x) {
+  sum(x == 0) / length(x) * 100
+})
+zero_percentages
+# Oligodendrocyte       Astrocyte     Endothelial     Motoneurons       Microglia     Macrophages 
+#      0.0000000       1.2048193       0.4016064       0.0000000      10.8433735      56.2248996 
+```
+
+#Modelling
+GAMMA: "Motoneurons"  "Oligodendrocyte" - when no zeros 
+TWEEDIE: "Astrocyte"  "Macrophages"  "Microglia"  "Endothelial"  - when zeros exist
+
+```{r}
+##### gamma regression #####
+#motoneurons 
+fit_mot <- glmmTMB(
+  Motoneurons ~ sex + age + level + (1 | donor),
+  family = Gamma(link = "log"),
+  data = data
+)
+
+##### tweedie regression #####
+#oligo (even tho it doesn't have zero in the data, tweedie has lower AIC)
+fit_oligo <- glmmTMB(
+  Oligodendrocyte ~ sex + age + level + (1 | donor),
+  family = tweedie(link = "log"),
+  data = data
+)
+
+#astrocyte 
+fit_ast <- glmmTMB(
+  Astrocyte ~ sex + age + level + (1 | donor),
+  family = tweedie(link = "log"),
+  data = data
+)
+
+#microglia
+fit_micro <- glmmTMB(
+  Microglia ~ sex + age + level + (1 | donor),
+  family = tweedie(link = "log"),
+  data = data
+)
+
+#endothelial 
+fit_end <- glmmTMB(
+  Endothelial ~ sex + age + level + (1 | donor),
+  family = tweedie(link = "log"),
+  data = data
+)
+
+#macrophage 
+fit_mac <- glmmTMB(
+  Macrophages ~ sex + age + level + (1 | donor),
+  family = tweedie(link = "log"),
+  data = data
+)
+```
+
+# emmeans 
+
+```{r}
+library(broom.mixed)
+library(dplyr)
+library(purrr)
+
+data$level <- factor(
+  data$level,
+  levels = c(
+    "Cervical_Spinal_Cord",
+    "Thoracic_Spinal_Cord",
+    "Lumbar_Spinal_Cord"
+  )
+)
+
+models <- list(
+  Astrocytes    = fit_ast,
+  Endothelial   = fit_end,
+  Oligodendrocytes = fit_oligo,
+  Macrophages   = fit_mac,
+  Motoneurons   = fit_mot
+)
+
+significant_level_comparisons <- imap_dfr(
+  models,
+  function(fit, cell_type) {
+    
+    emm <- emmeans(fit, ~ level)
+    
+    results <- summary(
+      contrast(
+        emm,
+        method = "revpairwise",
+        adjust = "tukey"
+      ),
+      infer = c(TRUE, TRUE),
+      type = "response"
+    ) |>
+      as.data.frame()
+    
+    results |>
+      filter(p.value < 0.05) |>
+      transmute(
+        Cell_type = cell_type,
+        Comparison = contrast,
+        Ratio = ratio,
+        CI_lower = asymp.LCL,
+        CI_upper = asymp.UCL,
+        P_value = p.value
+      )
+  }
+)
+
+significant_level_comparisons
+```
+
+#marginal means
+
+```{r}
+######## level ########
+# rewrite levels 
+data <- data %>%
+  mutate(level = case_when(
+    level == "Cervical_Spinal_Cord" ~ "Cervical",
+    level == "Thoracic_Spinal_Cord" ~ "Thoracic",
+    level == "Lumbar_Spinal_Cord"   ~ "Lumbar",
+    TRUE ~ level
+  ))
+  
+# consistent colors + theme
+level_cols <- c(
+  "Cervical" = "salmon",
+  "Thoracic" = "#1E90FF",
+  "Lumbar"   = "#2ca02c"
+)
+
+theme_pub <- function() {
+  theme_bw() +
+    theme(
+      legend.title = element_text(size = 14,hjust = 0.5),
+      legend.text  = element_text(size = 14),
+      axis.title   = element_text(size = 14),
+      axis.text    = element_text(size = 12)
+    )
+}
+
+# helper: build sig-bar df for stat_pvalue_manual
+make_pairs_df <- function(emm_obj, emm_df) {
+  as.data.frame(pairs(emm_obj, adjust = "tukey")) %>%
+    mutate(
+      group1 = sub(" /.*", "", contrast),
+      group2 = sub(".* / ", "", contrast),
+      p.signif = case_when(
+        p.value <= 0.001 ~ "***",
+        p.value <= 0.01  ~ "**",
+        p.value <= 0.05  ~ "*",
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    filter(!is.na(p.signif)) %>%                 # only keep sig comparisons
+    arrange(p.value) %>%
+    mutate(
+      y.position = max(emm_df$asymp.UCL, na.rm = TRUE) *
+        (1.05 + 0.08 * (row_number() - 1))
+    )
+}
+
+plot_emm_level <- function(fit, title, ylim = NULL, out = NULL) {
+  emm <- emmeans(fit, ~ level, type = "response")
+  emm_df <- as.data.frame(emm)
+  emm_df$level <- factor(
+  emm_df$level,
+  levels = c("Cervical", "Thoracic", "Lumbar"))
+  pairs_df <- make_pairs_df(emm, emm_df)
+
+  p <- ggplot(emm_df, aes(x = level, y = response, color = level)) +
+    geom_point(size = 8) +
+    geom_errorbar(aes(ymin = asymp.LCL, ymax = asymp.UCL), size = 1, width = 0.3) +
+    scale_color_manual(values = level_cols,
+                       breaks = c("Cervical","Thoracic","Lumbar")) +
+    labs(x = "Level", y = "Marginal Mean (Absolute Abundance)", title = title) +
+    theme_bw() +
+    theme(
+      legend.title = element_text(size = 11,hjust=0.5),
+      legend.text  = element_text(size = 11),
+      axis.title   = element_text(size = 20),
+      axis.text    = element_text(size = 18)
+    )
+
+  if (nrow(pairs_df) > 0) {
+    p <- p + stat_pvalue_manual(
+      pairs_df,
+      label = "p.signif",
+      tip.length = 0.03,
+      size = 6
+    )
+  }
+
+  if (!is.null(ylim)) p <- p + coord_cartesian(ylim = ylim)
+  if (!is.null(out)) ggsave(out, p, width = 8, height = 6, units = "in", dpi = 300)
+  p
+}
+
+
+# Motoneurons
+plot_emm_level(fit_mot, title = "Motoneurons", ylim = c(0, 2),
+               out = "Motoneurons_emmeans.png")
+# ggsave("Motoneurons_emmeans.svg",device = svglite,width = 5.5,height = 6)
+
+# Oligodrodrocyte 
+plot_emm_level(fit_oligo, title = "Oligodendrocyte", 
+                     out = "Oligodrndrocyte_emmeans.png")
+# ggsave("Oligodrndrocyte_emmeans.svg",device = svglite,width = 5.5,height = 6)
+
+# Endothelial 
+plot_emm_level(fit_end, title = "Endothelial", ylim = c(0, 2),
+                     out = "Endothelial_emmeans.png")
+# ggsave("Endothelial_emmeans.svg",device = svglite,width = 5.5,height = 6)
+
+# Macrophage 
+plot_emm_level(fit_mac, title = "Macrophage", ylim = c(0, 2),
+                     out = "Macrophage_emmeans.png")
+# ggsave("Macrophage_emmeans.svg",device = svglite,width = 5.5,height = 6)
+
+
+######## age ########
+# macrophage 
+age_p <- summary(fit_mac)$coefficients$cond["age", "Pr(>|z|)"]
+pred_obs <- ggpredict(fit_mac, terms = c("age")) %>% as.data.frame()
+ggplot(data, aes(x = age, y = Macrophages)) +
+  geom_point(alpha = 0.4) +
+  geom_line(data = pred_obs, aes(x = x, y = predicted, color = group),
+            linewidth = 1) +
+  theme_bw() +
+  labs(x = "Age", y = "Absolute Abundance",
+       title="Macrophage")+
+  ylim(0,0.5)+
+  theme(
+      plot.title = element_text(size=20,hjust=0.5),
+      legend.text = element_text(size = 18), 
+      axis.title = element_text(size = 20), 
+      axis.text = element_text(size = 18)
+  )+ annotate("text", x = Inf, y = Inf, hjust = 1.2, vjust = 1.5,
+                            label = paste0("p = ", signif(age_p, 3)), size = 6)
+# ggsave("Macrophage_age.svg",device = svglite,width = 7,height = 11)
+
+```

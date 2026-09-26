@@ -1,0 +1,1885 @@
+---
+title: "DGE_GSEA"
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+library(readxl)
+library(biomaRt)
+library(data.table)
+library(dplyr)
+library(ggrepel)
+library(ggplot2)
+library(readr)
+library(stringr)
+library(tidyr)
+library(devtools)
+library(DESeq2)
+library(tidyverse)
+library(edgeR)
+library(writexl)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(svglite)
+
+knitr::opts_knit$set(root.dir = "/Users/cindywang/Desktop/Kramer/Publication/Data")
+```
+
+# Sex
+
+```{r}
+setwd("/Users/cindywang/Desktop/Kramer/Publication/Data")
+sex<-read.csv("sex(autosomal)_ENSEMBL(in).csv")
+
+# add pre-count sig genes on top of plot 
+sex$case<-as.factor(sex$case)
+count_sex<-sex %>% dplyr::count(case)
+annot_df<-count_sex %>%
+  mutate(
+    x=case_when(
+      case=="A"~0.5,
+      case=="B"~1.5,
+      case=="C"~-0.5,
+      case=="D"~-1.5),
+    y = max(-log10(sex$p_value)) * 1.05
+  )
+
+##p value 
+ggplot(data = sex, aes(x = log_fc, y = -log10(p_value))) + 
+  geom_point(aes(color = case), size = 1.2,alpha=1) +
+  scale_colour_manual(
+    values = c(
+      "A" = "#92c5de",
+      "B" = "#0571b0",
+      "C"="#fdae61",
+      "D"="#ca0020",
+      "E" = "gray"
+    )
+  ) +
+  theme_classic() +
+  theme(axis.text = element_text(colour = "black")) +
+  guides(colour = "none") +
+  labs(
+    y = expression(-log[10]~P),
+    x = expression(log[2]~fold~change),
+    subtitle = "101 Female vs 148 Male"
+  )+
+  theme(axis.title = element_text(size=15),
+        axis.text = element_text(size = 15),
+        legend.title = element_text(size = 20),
+        legend.text  = element_text(size = 20),
+        title = element_text(size=20),
+        plot.subtitle = element_text(size=20,hjust = 0.5))+
+  xlim(-1,1)+
+  geom_text(
+    data = annot_df,
+    aes(x = x, y = y, label = n, color = case),
+    size = 6,
+    fontface = "bold",
+    show.legend = FALSE
+  )
+# ggsave("Combined_DREAM_sex_pub.png",width=6,height=6,unit="in",dpi = 300)
+
+ggsave(
+  "Combined_DREAM_sex_pub.svg",
+  device = svglite,
+  width = 6,
+  height = 6
+)
+```
+
+## Find DEG 
+
+```{r}
+# isolate the interesting columns 
+sex_deg<-sex %>%
+  filter(case %in% c("A","B","C","D")) %>%
+  dplyr::select(geneid,log_fc,adj_p_val,case)
+
+# edit 
+sex_deg<-sex_deg %>%
+  mutate(
+    LFC=round(log_fc,2),
+    Adjusted_p_value = case_when(
+      adj_p_val<0.0005~"<0.0005",
+      adj_p_val<0.005~"<0.005",
+      adj_p_val<0.05~"<0.05",
+      TRUE~as.character(adj_p_val)
+    ),
+    Category=recode(
+      case,
+      "A"="Moderately upregulated in male",
+      "B"="Strongly upregulated in male",
+      "C"="Moderately upregulated in female",
+      "D"="Strongly upregulated in female"
+    )) %>%
+  dplyr::select(-log_fc,-adj_p_val,-case) %>%
+  arrange(desc(LFC))
+
+
+# convert ENSEMBL ID to gene symbol
+mart <- useEnsembl(
+  biomart = "genes",
+  dataset = "hsapiens_gene_ensembl"
+)
+
+# Query Ensembl
+gene_map <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  filters = "ensembl_gene_id",
+  values = sex_deg$geneid,
+  mart = mart
+)
+
+
+#combine deg and gene_map based on ensembl ID 
+sex_deg_gene_name<- sex_deg %>%
+  left_join(
+    gene_map,
+    by = c("geneid" = "ensembl_gene_id")
+  )
+
+write_xlsx(sex_deg_gene_name, "sex_deg.xlsx")
+```
+
+## GSEA
+leading edge genes
+
+```{r}
+res<-sex
+
+ranks <- res$t
+names(ranks) <- res$geneid
+ranks <- sort(ranks, decreasing = TRUE)
+
+set.seed(42)  # gseGO uses permutation-based fgsea internally; fix seed for reproducibility
+gobp_gsea_sex <- gseGO(
+  geneList      = ranks,
+  OrgDb         = org.Hs.eg.db,
+  ont           = "BP",
+  keyType       = "ENSEMBL",
+  minGSSize     = 15,
+  maxGSSize     = 500,
+  pvalueCutoff  = 1,
+  pAdjustMethod = "BH",
+  eps           = 0,
+  seed          = TRUE,
+  verbose       = FALSE
+)
+
+#plotting 
+df <- as.data.frame(gobp_gsea_sex)
+
+n_show <- 4
+plot_df <- df %>%
+  arrange(desc(NES)) %>%
+  slice_head(n = n_show) %>%
+  bind_rows(df %>% arrange(NES) %>% slice_head(n = n_show)) %>%
+  mutate(Description = fct_reorder(Description, NES)) %>%
+  mutate(fill_group = case_when(
+    NES > 0 & p.adjust <= 0.05 ~ "Up_sig",
+    NES > 0 & p.adjust > 0.05 ~ "Up_ns",
+    NES < 0 & p.adjust <= 0.05 ~ "Down_sig",
+    TRUE ~ "Down_ns"
+  )) 
+
+
+sex_gsea<-ggplot(plot_df, aes(x = NES, y = Description, fill = fill_group)) +
+  geom_col(width = 0.85) +
+  scale_fill_manual(values = c(
+    "Up_sig"   = "#2c7bb6",
+    "Up_ns"    = "#abd9e9",
+    "Down_sig" = "#d7191c",
+    "Down_ns"  = "#fdae61"
+  )) +
+  geom_vline(xintercept = 0) +
+  labs(x = "Normalized Enrichment Score", y = NULL, fill = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "top",
+    panel.grid.major.y = element_blank()
+  ) +
+  scale_x_continuous(
+    limits = c(-3, 3),
+    breaks = c(-2, 0, 2)
+  )
+
+# Save the exact same plot
+ggsave(
+  filename = "sex_GSEA.pdf",
+  plot = sex_gsea,
+  width = 12,
+  height = 6,
+  units = "in"
+)
+
+```
+
+## leading edge genes
+
+```{r}
+#### thoracic lumbar #### 
+gsea_res <- as.data.frame(gobp_gsea_sex)
+
+# Top 4 positive and top 4 negative pathways
+top_pathways <- bind_rows(
+  gsea_res %>%
+    filter(NES > 0) %>%
+    arrange(desc(NES)) %>%
+    slice_head(n = 4),
+
+  gsea_res %>%
+    filter(NES < 0) %>%
+    arrange(NES) %>%
+    slice_head(n = 7)
+)
+
+# Create a 2-column data frame
+leading_edge_df <- top_pathways %>%
+  rowwise() %>%
+  mutate(
+    Leading_edge_genes = {
+      ensembl <- unlist(strsplit(core_enrichment, "/"))
+      symbols <- mapIds(
+        org.Hs.eg.db,
+        keys = ensembl,
+        keytype = "ENSEMBL",
+        column = "SYMBOL",
+        multiVals = "first"
+      )
+      paste(na.omit(symbols), collapse = ", ")
+    }
+  ) %>%
+  ungroup() %>%
+  dplyr::select(
+    Pathway = Description,
+    Leading_edge_genes
+  )
+
+View(leading_edge_df)
+# write.csv(leading_edge_df, "leg_sex.csv", row.names = FALSE)
+```
+
+## validation cohort 
+
+include sex chromosome genes 
+```{r}
+#find which sex-chr genes are differentially expressed 
+library(biomaRt)
+mart<-useEnsembl(
+  biomart = "genes",
+  dataset = "hsapiens_gene_ensembl",
+  mirror = "useast"
+)
+
+sex_chr_df<-getBM(
+  attributes = c(
+    "ensembl_gene_id",
+    "hgnc_symbol",
+    "chromosome_name"
+  ),
+  filters="chromosome_name",
+  values=c("X","Y"),
+  mart = mart
+)
+
+sex_chr_df<-subset(sex_chr_df,hgnc_symbol!="")
+sex_genes<-unique(sex_chr_df$hgnc_symbol)
+
+sex_chr_genes_df<-data.frame(
+  gene_name=sex_genes,
+  stringsAsFactors = FALSE
+)
+
+# load data 
+sex_val<-read.csv("validtion(include_sex_chr_genes).csv")
+
+# #add pre-count sig genes on top of plot 
+sex_val$case<-as.factor(sex_val$case)
+count_sex<-sex_val %>% dplyr::count(case)
+annot_df<-count_sex %>%
+  mutate(
+    x=case_when(
+      case=="A"~0.5,
+      case=="B"~1.5,
+      case=="C"~-0.5,
+      case=="D"~-1.5),
+    y = max(-log10(sex_val$p_value)) * 1.05
+  )
+
+# pull sig genes 
+sig_genes<-sex_val %>%
+  dplyr::filter(case %in% c("A","B","C","D")) %>%
+  dplyr::pull(geneid)
+
+# find overlap with sex chro genes 
+overlap_sex_chr<-intersect(sig_genes,sex_chr_genes_df$gene_name)
+length(overlap_sex_chr) #50 
+
+#label the significant, protein-coding genes 
+highlight_df <- sex_val %>% filter(geneid %in% overlap_sex_chr)
+
+##p value 
+ggplot(data = sex_val, aes(x = log_fc, y = -log10(p_value))) + 
+  geom_point(aes(color = case), size = 1.2,alpha=1) +
+  scale_colour_manual(
+    values = c(
+      "A" = "#92c5de",
+      "B" = "#0571b0",
+      "C"="#fdae61",
+      "D"="#ca0020",
+      "E" = "gray"
+    )
+  ) +
+  theme_classic() +
+  theme(axis.text = element_text(colour = "black")) +
+  guides(colour = "none") +
+  labs(
+    y = expression(-log[10]~P),
+    x = expression(log[2]~fold~change),
+    subtitle = "101 Female vs 148 Male (including sex chromosome genes)"
+  )+  
+  geom_text_repel(
+    data = highlight_df,
+    aes(label = geneid),
+    size = 5,
+    fontface = "bold",
+    color = "black",
+    segment.color = "black",
+    segment.size = 0.8,
+    min.segment.length = 0,
+    box.padding = 0.4,
+    point.padding = 0.3
+  )+
+  theme(axis.title = element_text(size=15),
+        axis.text = element_text(size = 15),
+        legend.title = element_text(size = 20),
+        legend.text  = element_text(size = 20),
+        title = element_text(size=20),
+        plot.subtitle = element_text(size=20,hjust = 0.5))+
+  geom_text(
+    data = annot_df,
+    aes(x = x, y = y, label = n, color = case),
+    size = 6,
+    fontface = "bold",
+    show.legend = FALSE
+  )
+
+# ggsave("validation_sex_chr_genes.png",width=10,height=8,unit="in",dpi = 300)
+```
+
+#Level
+
+```{r}
+cerv_hox<-c("HOXC4",
+           "HOXA5","HOXB5","HOXC5",
+           "HOXA6","HOXB6","HOXC6",
+           "HOXA7","HOXB7",
+           "HOXB8","HOXC8","HOXD8")
+
+thor_hox<-c("HOXC8","HOXD8",
+           "HOXA9","HOXC9","HOXD9")
+
+lum_hox<-c("HOXD9",
+           "HOXA10", "HOXC10", "HOXD10",
+           "HOXA11","HOXC11", "HOXD11")
+
+# convert ENSEMBL ID to gene symbol
+mart <- useEnsembl(
+  biomart = "genes",
+  dataset = "hsapiens_gene_ensembl"
+)
+
+# Combine all HOX genes and remove duplicates
+hox_genes <- unique(c(cerv_hox, thor_hox, lum_hox))
+
+# Query Ensembl
+gene_map <- getBM(
+  attributes = c("hgnc_symbol","ensembl_gene_id"),
+  filters = "hgnc_symbol",
+  values = hox_genes,
+  mart = mart
+)
+
+#match the corresponding ENSEMBL IDs for each HOX gene
+cerv_hox_ensembl<-gene_map %>%
+  filter(hgnc_symbol %in% cerv_hox) %>%
+  pull(ensembl_gene_id)
+
+thor_hox_ensembl<-gene_map %>%
+  filter(hgnc_symbol %in% thor_hox) %>%
+  pull(ensembl_gene_id)
+
+lum_hox_ensembl<-gene_map %>%
+  filter(hgnc_symbol %in% lum_hox) %>%
+  pull(ensembl_gene_id)
+
+```
+
+
+```{r}
+####### lumbar vs cervical #######
+setwd("/Users/cindywang/Desktop/Kramer/Publication/Data")
+lumcerv<-read.csv("cerv_lumb(refCerv)_ENSEMBL(in).csv") %>%
+  as.data.frame()
+
+#add pre-count sig genes on top of plot 
+lumcerv$case<-as.factor(lumcerv$case)
+count_lumcerv<-lumcerv %>% dplyr::count(case)
+annot_df<-count_lumcerv %>%
+  mutate(
+    x=case_when(
+      case=="A"~0.5,
+      case=="B"~1.5,
+      case=="C"~-0.5,
+      case=="D"~-1.5),
+    y = max(-log10(lumcerv$p_value)) * 1.1
+  )
+
+#highlight 
+genes_to_label <- c(cerv_hox_ensembl,lum_hox_ensembl) # HOX genes
+highlight_df <- lumcerv %>%
+  filter(geneid %in% genes_to_label) %>%
+  left_join(
+    gene_map,
+    by = c("geneid" = "ensembl_gene_id")
+  )
+
+#p value
+ggplot(data = lumcerv, aes(x = log_fc, y = -log10(p_value))) + 
+  geom_point(aes(color = case), size = 0.8) +
+  scale_colour_manual(
+    values = c(
+     "A" = "#5F9FA0",
+      "B" = "#003F3F",
+      "C"="#F2A463",
+      "D"="#FF6f61",
+      "E" = "gray"
+    )
+  ) +
+  theme_classic() +
+  theme(axis.text = element_text(colour = "black")) +
+  guides(colour = "none") +
+  labs(
+    y = expression(-log[10]~P),
+    x = expression(log[2]~fold~change),
+    subtitle = "195 Cervical vs 43 Lumbar"
+  )+
+  theme(axis.title = element_text(size=15),
+        axis.text = element_text(size = 15),
+        legend.title = element_text(size = 20),
+        legend.text  = element_text(size = 20),
+        title = element_text(size=20),
+        plot.subtitle = element_text(size=20,hjust = 0.5)
+        )+
+  geom_text_repel(
+    data = highlight_df,
+    aes(label = hgnc_symbol),
+    size = 5,
+    fontface = "bold",
+    color = "black",
+    segment.color = "black",
+    segment.size = 0.8,
+    min.segment.length = 0,
+    box.padding = 0.4,
+    point.padding = 0.3
+  )+
+  xlim(-4,4.5)+
+  geom_text(
+    data = annot_df,
+    aes(x = x, y = y, label = n, color = case),
+    size = 6,
+    fontface = "bold",
+    show.legend = FALSE
+  )
+
+# ggsave(
+#   "DREAM_cervlum_pub.pdf",
+#   width = 6,
+#   height = 6,
+# )
+
+####### Cervical vs thoracic #######
+setwd("/Users/cindywang/Desktop/Kramer/Publication/Data")
+cervthor<-read.csv("cerv_thor(refCerv)_ENSEMBL(in).csv") %>%
+  as.data.frame()
+
+sum(cervthor$case =="A" | cervthor$case =="B") 
+sum(cervthor$case =="C" | cervthor$case =="D") 
+
+#add pre-count sig genes on top of plot 
+cervthor$case<-as.factor(cervthor$case)
+count_cervthor<-cervthor %>% dplyr::count(case)
+annot_df<-count_cervthor %>%
+  mutate(
+    x=case_when(
+      case=="A"~0.5,
+      case=="B"~1.5,
+      case=="C"~-0.5,
+      case=="D"~-1.5),
+    y = 15
+  )
+
+genes_to_label <- c(cerv_hox_ensembl,thor_hox_ensembl)
+highlight_df <- cervthor %>% 
+  filter(geneid %in% genes_to_label) %>%
+  left_join(
+    gene_map,
+    by = c("geneid" = "ensembl_gene_id")
+  )
+
+##p value 
+ggplot(data = cervthor, aes(x = log_fc, y = -log10(p_value))) + 
+  geom_point(aes(color = case), size = 0.8) +
+  scale_colour_manual(
+    values = c(
+      "A" = "#5F9FA0",
+      "B" = "#003F3F",
+      "C"="#F2A463",
+      "D"="#FF6f61",
+      "E" = "gray"
+    )
+  ) +
+  theme_classic() +
+  theme(axis.text = element_text(colour = "black")) +
+  guides(colour = "none") +
+  labs(
+    y = expression(-log[10]~P),
+    x = expression(log[2]~fold~change),
+    subtitle = "195 Cervical vs 11 Thoracic"
+  )+
+  theme(axis.title = element_text(size=15),
+        axis.text = element_text(size = 15),
+        legend.title = element_text(size = 20),
+        legend.text  = element_text(size = 20),
+        title = element_text(size=20),
+        plot.subtitle = element_text(size=20,hjust = 0.5)
+        )+
+  xlim(-4,4.5)+
+  geom_text_repel(
+    data = highlight_df,
+    aes(label = hgnc_symbol),
+    size = 5,
+    fontface = "bold",
+    color = "black",
+    segment.color = "black",
+    segment.size = 0.8,
+    min.segment.length = 0,
+    box.padding = 0.4,
+    point.padding = 0.3
+  )+
+  geom_text(
+    data = annot_df,
+    aes(x = x, y = y, label = n, color = case),
+    size = 6,
+    fontface = "bold",
+    show.legend = FALSE
+  )
+# ggsave(
+#   "DREAM_cervthora.pdf",
+#   width = 6,
+#   height = 6
+# )
+
+######## thoracic & lumbar
+setwd("/Users/cindywang/Desktop/Kramer/Publication/Data")
+thorlum<-read.csv("thor_lum(refThor)_ENSEMBL(in).csv")%>%
+  as.data.frame()
+
+sum(thorlum$case =="A" | thorlum$case =="B") 
+sum(thorlum$case =="C" | thorlum$case =="D") 
+
+#add pre-count sig genes on top of plot 
+thorlum$case<-as.factor(thorlum$case)
+count_thorlum<-thorlum %>% dplyr::count(case)
+annot_df<-count_thorlum %>%
+  mutate(
+    x=case_when(
+      case=="A"~0.5,
+      case=="B"~1.5,
+      case=="C"~-0.5,
+      case=="D"~-1.5),
+    y = 15
+  )
+
+# highlight 
+genes_to_label <- c(lum_hox_ensembl,thor_hox_ensembl) # HOX genes
+highlight_df <- thorlum %>% 
+  filter(geneid %in% genes_to_label) %>%
+  left_join(
+    gene_map,
+    by = c("geneid" = "ensembl_gene_id")
+  )
+
+#plot 
+ggplot(data = thorlum, aes(x = log_fc, y = -log10(p_value))) + 
+  geom_point(aes(color = case), size = 0.8) +
+  scale_colour_manual(
+    values = c(
+      "A" = "#5F9FA0",
+      "B" = "#003F3F",
+      "C"="#F2A463",
+      "D"="#FF6f61",
+      "E" = "gray"
+    )
+  ) +
+  theme_classic() +
+  theme(axis.text = element_text(colour = "black")) +
+  guides(colour = "none") +
+  labs(
+    y = expression(-log[10]~P),
+    x = expression(log[2]~fold~change),
+    subtitle = "11 Thoracic vs 43 Lumbar"
+  )+
+  theme(axis.title = element_text(size=15),
+        axis.text = element_text(size = 15),
+        legend.title = element_text(size = 20),
+        legend.text  = element_text(size = 20),
+        title = element_text(size=20),
+        plot.subtitle = element_text(size=20,hjust = 0.5)
+        )+
+  xlim(-4,4.5)+
+  geom_text_repel(
+    data = highlight_df,
+    aes(label = hgnc_symbol),
+    size = 5,
+    fontface = "bold",
+    color = "black",
+    segment.color = "black",
+    segment.size = 0.8,
+    min.segment.length = 0,
+    box.padding = 0.4,
+    point.padding = 0.3
+  )+
+  ylim(0,15)+
+  geom_text(
+    data = annot_df,
+    aes(x = x, y = y, label = n, color = case),
+    size = 6,
+    fontface = "bold",
+    show.legend = FALSE
+  )
+
+# ggsave(
+#   "thorlum_test.pdf",
+#   width = 6,
+#   height = 6
+# )
+
+```
+
+## Find DEG
+
+```{r}
+###### cervical thoracic ######
+cervthor_deg<-cervthor %>%
+  filter(case %in% c("A","B","C","D")) %>%
+  dplyr::select(geneid,log_fc,adj_p_val,case)
+
+cervthor_deg<-cervthor_deg %>%
+  mutate(
+    LFC=round(log_fc,2),
+    Adjusted_p_value = case_when(
+      adj_p_val<0.0005~"<0.0005",
+      adj_p_val<0.005~"<0.005",
+      adj_p_val<0.05~"<0.05",
+      TRUE~as.character(adj_p_val)
+    ),
+    Category=recode(
+      case,
+      "A"="Moderately upregulated in thoracic",
+      "B"="Strongly upregulated in thoracic",
+      "C"="Moderately upregulated in cervical",
+      "D"="Strongly upregulated in cervical"
+    )) %>%
+  dplyr::select(-log_fc,-adj_p_val,-case) %>%
+  arrange(desc(LFC))
+
+# edit 
+# convert ENSEMBL ID to gene symbol
+# mart <- useEnsembl(
+#   biomart = "genes",
+#   dataset = "hsapiens_gene_ensembl"
+# )
+
+# Query Ensembl
+gene_map <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  filters = "ensembl_gene_id",
+  values = cervthor_deg$geneid,
+  mart = mart
+)
+
+#combine deg and gene_map based on ensembl ID 
+cervthor_deg_gene_name<- cervthor_deg %>%
+  left_join(
+    gene_map,
+    by = c("geneid" = "ensembl_gene_id")
+  )
+write_xlsx(cervthor_deg_gene_name, "cervthor_deg.xlsx")
+
+
+
+
+###### lumbar cervical ######
+lumcerv_deg<-lumcerv %>%
+  filter(case %in% c("A","B","C","D")) %>%
+  dplyr::select(geneid,log_fc,adj_p_val,case)
+
+lumcerv_deg<-lumcerv_deg %>%
+  mutate(
+    LFC=round(log_fc,2),
+    Adjusted_p_value = case_when(
+      adj_p_val<0.0005~"<0.0005",
+      adj_p_val<0.005~"<0.005",
+      adj_p_val<0.05~"<0.05",
+      TRUE~as.character(adj_p_val)
+    ),
+    Category=recode(
+      case,
+      "A"="Moderately upregulated in lumbar",
+      "B"="Strongly upregulated in lumbar",
+      "C"="Moderately upregulated in cervical",
+      "D"="Strongly upregulated in cervical"
+    )) %>%
+  dplyr::select(-log_fc,-adj_p_val,-case) %>%
+  arrange(desc(LFC))%>%
+  dplyr::rename(Gene=geneid)
+
+# Query Ensembl
+gene_map <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  filters = "ensembl_gene_id",
+  values = lumcerv_deg$Gene,
+  mart = mart
+)
+
+#combine deg and gene_map based on ensembl ID 
+lumcerv_deg_gene_name<- lumcerv_deg %>%
+  left_join(
+    gene_map,
+    by = c("Gene" = "ensembl_gene_id")
+  )
+write_xlsx(lumcerv_deg_gene_name, "Lumbcerv_deg.xlsx")
+
+
+
+
+###### thoracic lumbar ######
+thorlum_deg<-thorlum %>%
+  filter(case %in% c("A","B","C","D")) %>%
+  dplyr::select(geneid,log_fc,adj_p_val,case)
+
+thorlum_deg<-thorlum_deg %>%
+  mutate(
+    LFC=round(log_fc,2),
+    Adjusted_p_value = case_when(
+      adj_p_val<0.0005~"<0.0005",
+      adj_p_val<0.005~"<0.005",
+      adj_p_val<0.05~"<0.05",
+      TRUE~as.character(adj_p_val)
+    ),
+    Category=recode(
+      case,
+      "A"="Moderately upregulated in lumbar",
+      "B"="Strongly upregulated in lumbar",
+      "C"="Moderately upregulated in thoracic",
+      "D"="Strongly upregulated in thoracic"
+    )) %>%
+  dplyr::select(-log_fc,-adj_p_val,-case) %>%
+  arrange(desc(LFC))%>%
+  dplyr::rename(Gene=geneid)
+
+# Query Ensembl
+gene_map <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  filters = "ensembl_gene_id",
+  values = thorlum_deg$Gene,
+  mart = mart
+)
+
+#combine deg and gene_map based on ensembl ID 
+thorlum_deg_gene_name<- thorlum_deg %>%
+  left_join(
+    gene_map,
+    by = c("Gene" = "ensembl_gene_id")
+  )
+
+write_xlsx(thorlum_deg_gene_name, "thorlum_deg.xlsx")
+```
+
+## GSEA Level 
+
+```{r}
+## lumbar cervical comparison 
+res<-lumcerv
+
+# use t stats as ranking metric 
+ranks <- res$t
+names(ranks) <- res$geneid
+ranks <- sort(ranks, decreasing = TRUE)
+
+set.seed(1)  
+gobp_gsea_cervlum <- gseGO(
+  geneList      = ranks,
+  OrgDb         = org.Hs.eg.db,
+  ont           = "BP",
+  keyType       = "ENSEMBL",
+  minGSSize     = 15,
+  maxGSSize     = 500,
+  pvalueCutoff  = 1,
+  pAdjustMethod = "BH",
+  eps           = 0,
+  seed          = TRUE,
+  verbose       = FALSE
+)
+
+#plotting 
+df <- as.data.frame(gobp_gsea_cervlum)
+
+n_show <- 4
+plot_df <- df %>%
+  arrange(desc(NES)) %>%
+  slice_head(n = n_show) %>%
+  bind_rows(df %>% arrange(NES) %>% slice_head(n = n_show)) %>%
+  mutate(Description = fct_reorder(Description, NES)) %>%
+  mutate(fill_group = case_when(
+    NES > 0 & p.adjust <= 0.05 ~ "Up_sig",
+    NES > 0 & p.adjust > 0.05 ~ "Up_ns",
+    NES < 0 & p.adjust <= 0.05 ~ "Down_sig",
+    TRUE ~ "Down_ns"
+  )) 
+
+lumcerv<-ggplot(plot_df, aes(x = NES, y = Description, fill = fill_group)) +
+  geom_col(width = 0.85) +
+  scale_fill_manual(values = c(
+  "Up_sig"   = "#FF8822",
+  "Up_ns"    = "#abd9e9",
+  "Down_sig" = "#ffc30b",
+  "Down_ns"  = "#008000"
+  ))+
+  geom_vline(xintercept = 0) +
+  labs(x = "Normalized Enrichment Score", y = NULL, fill = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top", panel.grid.major.y = element_blank())+ 
+  scale_x_continuous(breaks = c(-2.5,0, 2.5)) + 
+  xlim(-4.5,4.5)
+
+ggsave(
+  filename = "lumcerv_GSEA.pdf",
+  plot = lumcerv,
+  width = 12,
+  height = 6,
+  units = "in"
+)
+
+
+
+
+## cervical thoracic comparison 
+res<- cervthor
+
+# use t stats as ranking metric
+ranks <- res$t
+names(ranks) <- res$geneid
+ranks <- sort(ranks, decreasing = TRUE)
+
+set.seed(40)
+gobp_gsea_cervthor <- gseGO(
+  geneList      = ranks,
+  OrgDb         = org.Hs.eg.db,
+  ont           = "BP",
+  keyType       = "ENSEMBL",
+  minGSSize     = 15,
+  maxGSSize     = 500,
+  pvalueCutoff  = 1,
+  pAdjustMethod = "BH",
+  eps           = 0,
+  seed          = TRUE,
+  verbose       = FALSE
+)
+
+#plotting 
+df <- as.data.frame(gobp_gsea_cervthor)
+
+n_show <- 4
+plot_df <- df %>%
+  arrange(desc(NES)) %>%
+  slice_head(n = n_show) %>%
+  bind_rows(df %>% arrange(NES) %>% slice_head(n = n_show)) %>%
+  mutate(Description = fct_reorder(Description, NES)) %>%
+  mutate(fill_group = case_when(
+    NES > 0 & p.adjust <= 0.05 ~ "Up_sig",
+    NES > 0 & p.adjust > 0.05 ~ "Up_ns",
+    NES < 0 & p.adjust <= 0.05 ~ "Down_sig",
+    TRUE ~ "Down_ns"
+  )) 
+
+pdf("cervthor_GSEA.pdf", width=12, height=6)
+
+ggplot(plot_df, aes(x = NES, y = Description, fill = fill_group)) +
+  geom_col(width = 0.85) +
+  scale_fill_manual(values = c(
+  "Up_sig"   = "#FF8822",
+  "Up_ns"    = "#abd9e9",
+  "Down_sig" = "#ffc30b",
+  "Down_ns"  = "#008000"
+  ))+
+  geom_vline(xintercept = 0) +
+  labs(x = "Normalized Enrichment Score", y = NULL, fill = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top", 
+        panel.grid.major.y = element_blank())+ 
+  xlim(-4,4.2)
+
+dev.off()
+
+
+
+
+######### thoracic lumbar ######### 
+res<- thorlum
+
+# use t stats as ranking metric
+ranks <- res$t
+names(ranks) <- res$geneid
+ranks <- sort(ranks, decreasing = TRUE)
+
+set.seed(40)
+gobp_gsea_thorlum <- gseGO(
+  geneList      = ranks,
+  OrgDb         = org.Hs.eg.db,
+  ont           = "BP",
+  keyType       = "ENSEMBL",
+  minGSSize     = 15,
+  maxGSSize     = 500,
+  pvalueCutoff  = 1,
+  pAdjustMethod = "BH",
+  eps           = 0,
+  seed          = TRUE,
+  verbose       = FALSE
+)
+
+#plotting 
+df <- as.data.frame(gobp_gsea_thorlum)
+
+n_show <- 4
+plot_df <- df %>%
+  arrange(desc(NES)) %>%
+  slice_head(n = n_show) %>%
+  bind_rows(df %>% arrange(NES) %>% slice_head(n = n_show)) %>%
+  mutate(Description = fct_reorder(Description, NES)) %>%
+  mutate(fill_group = case_when(
+    NES > 0 & p.adjust <= 0.05 ~ "Up_sig",
+    NES > 0 & p.adjust > 0.05 ~ "Up_ns",
+    NES < 0 & p.adjust <= 0.05 ~ "Down_sig",
+    TRUE ~ "Down_ns"
+  )) 
+
+pdf("thorlum_GSEA.pdf", width=12, height=6)
+
+ggplot(plot_df, aes(x = NES, y = Description, fill = fill_group)) +
+  geom_col(width = 0.85) +
+  scale_fill_manual(values = c(
+  "Up_sig"   = "#FF8822",
+  "Up_ns"    = "#abd9e9",
+  "Down_sig" = "#ffc30b",
+  "Down_ns"  = "#008000"
+  ))+
+  geom_vline(xintercept = 0) +
+  labs(x = "Normalized Enrichment Score", y = NULL, fill = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top", 
+        panel.grid.major.y = element_blank())+ 
+  xlim(-4.5,4.5)
+
+dev.off()
+
+```
+## leading edge genes
+
+```{r}
+#### thoracic lumbar #### 
+gsea_res <- as.data.frame(gobp_gsea_thorlum)
+
+# Top 4 positive and top 4 negative pathways
+top_pathways <- bind_rows(
+  gsea_res %>%
+    filter(NES > 0) %>%
+    arrange(desc(NES)) %>%
+    slice_head(n = 4),
+
+  gsea_res %>%
+    filter(NES < 0) %>%
+    arrange(NES) %>%
+    slice_head(n = 4)
+)
+
+# Create a 2-column data frame
+leading_edge_df <- top_pathways %>%
+  rowwise() %>%
+  mutate(
+    Leading_edge_genes = {
+      ensembl <- unlist(strsplit(core_enrichment, "/"))
+      symbols <- mapIds(
+        org.Hs.eg.db,
+        keys = ensembl,
+        keytype = "ENSEMBL",
+        column = "SYMBOL",
+        multiVals = "first"
+      )
+      paste(na.omit(symbols), collapse = ", ")
+    }
+  ) %>%
+  ungroup() %>%
+  dplyr::select(
+    Pathway = Description,
+    Leading_edge_genes
+  )
+
+leading_edge_df
+write.csv(leading_edge_df, "leg_thorlum.csv", row.names = FALSE)
+
+getwd()
+
+#### cervical thoracic #### 
+gsea_res <- as.data.frame(gobp_gsea_cervthor)
+
+# Top 4 positive and top 4 negative pathways
+top_pathways <- bind_rows(
+  gsea_res %>%
+    filter(NES > 0) %>%
+    arrange(desc(NES)) %>%
+    slice_head(n = 4),
+
+  gsea_res %>%
+    filter(NES < 0) %>%
+    arrange(NES) %>%
+    slice_head(n = 4)
+)
+
+# Create a 2-column data frame
+leading_edge_df <- top_pathways %>%
+  rowwise() %>%
+  mutate(
+    Leading_edge_genes = {
+      ensembl <- unlist(strsplit(core_enrichment, "/"))
+      symbols <- mapIds(
+        org.Hs.eg.db,
+        keys = ensembl,
+        keytype = "ENSEMBL",
+        column = "SYMBOL",
+        multiVals = "first"
+      )
+      paste(na.omit(symbols), collapse = ", ")
+    }
+  ) %>%
+  ungroup() %>%
+  dplyr::select(
+    Pathway = Description,
+    Leading_edge_genes
+  )
+
+leading_edge_df
+write.csv(leading_edge_df, "leg_cervthor.csv", row.names = FALSE)
+
+
+
+#### cervical lumbar ####
+gsea_res <- as.data.frame(gobp_gsea_cervlum)
+
+# Top 4 positive and top 4 negative pathways
+top_pathways <- bind_rows(
+  gsea_res %>%
+    filter(NES > 0) %>%
+    arrange(desc(NES)) %>%
+    slice_head(n = 4),
+
+  gsea_res %>%
+    filter(NES < 0) %>%
+    arrange(NES) %>%
+    slice_head(n = 4)
+)
+
+# Create a 2-column data frame
+leading_edge_df <- top_pathways %>%
+  rowwise() %>%
+  mutate(
+    Leading_edge_genes = {
+      ensembl <- unlist(strsplit(core_enrichment, "/"))
+      symbols <- mapIds(
+        org.Hs.eg.db,
+        keys = ensembl,
+        keytype = "ENSEMBL",
+        column = "SYMBOL",
+        multiVals = "first"
+      )
+      paste(na.omit(symbols), collapse = ", ")
+    }
+  ) %>%
+  ungroup() %>%
+  dplyr::select(
+    Pathway = Description,
+    Leading_edge_genes
+  )
+
+leading_edge_df
+write.csv(leading_edge_df, "leg_cervlum.csv", row.names = FALSE)
+
+
+```
+
+#Age (continuous)
+
+```{r}
+setwd("/Users/cindywang/Desktop/Kramer/Publication/Data")
+age<-read.csv("age_cont_ENSEMBL(in).csv")
+
+# age$case<-as.factor(age$case)
+count_age<-age %>% dplyr::count(case)
+annot_df<-count_age %>%
+  mutate(
+    x=case_when(
+      case=="A"~0.02,
+      case=="B"~1.5,
+      case=="C"~-0.02,
+      case=="D"~-1.5),
+    y = max(-log10(age$p_value)) * 1.1
+    )
+
+#find the number of significant genes with age
+sum(age$adj_p_val < 0.05 & age$case =="A") # 0 significant genes with age as a continuous variable
+sum(age$adj_p_val < 0.05 & age$case =="C")
+
+##p value 
+ggplot(data = age, aes(x = log_fc, y = -log10(p_value))) + 
+  geom_point(aes(color = case), size = 0.8) +
+  scale_colour_manual(
+    values = c(
+      "A" = "#92c5de",
+      "B" = "blue",
+      "C"="#fdae61",
+      "D"="#ca0020",
+      "E" = "gray"
+    )
+  ) +
+  theme_classic() +
+  theme(axis.text = element_text(colour = "black")) +
+  guides(colour = "none") +
+  labs(
+    y = expression(-log[10]~P),
+    x = expression(log[2]~fold~change),
+    subtitle = "Age"
+  )+
+  theme(axis.title = element_text(size=15),
+        axis.text = element_text(size = 15),
+        legend.title = element_text(size = 20),
+        legend.text  = element_text(size = 20),
+        title = element_text(size=20),
+        plot.subtitle = element_text(size=20,hjust = 0.5)
+        )+
+  geom_text(
+    data = annot_df,
+    aes(x = x, y = y, label = n, color = case),
+    size = 6,
+    fontface = "bold",
+    show.legend = FALSE
+  )
+# ggsave("Combined_DREAM_age_highlight.png",width=6,height=6,unit="in",dpi = 300)
+
+ggsave(
+  "Combined_DREAM_age_pub.svg",
+  device = svglite,
+  width = 6,
+  height = 6
+)
+```
+
+## Find DEG 
+
+```{r}
+# isolate the interesting columns
+age_deg<-age %>%
+  filter(case %in% c("A","B","C","D")) %>%
+  dplyr::select(geneid,log_fc,adj_p_val,case)
+
+# edit 
+age_deg<-age_deg %>%
+  mutate(
+    LFC=round(log_fc,2),
+    Adjusted_p_value = case_when(
+      adj_p_val<0.0005~"<0.0005",
+      adj_p_val<0.005~"<0.005",
+      adj_p_val<0.05~"<0.05",
+      TRUE~as.character(adj_p_val)
+    ),
+    Category=recode(
+      case,
+      "A"="Moderately upregulated in older individuals",
+      "B"="Strongly upregulated in older individuals",
+      "C"="Moderately upregulated in younger individuals",
+      "D"="Strongly upregulated in younger individuals"
+    )) %>%
+  dplyr::select(-log_fc,-adj_p_val,-case) %>%
+  arrange(desc(LFC)) 
+
+# convert ENSEMBL ID to gene symbol
+# mart <- useEnsembl(
+#   biomart = "genes",
+#   dataset = "hsapiens_gene_ensembl"
+# )
+
+# Query Ensembl
+gene_map <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  filters = "ensembl_gene_id",
+  values = age_deg$geneid,
+  mart = mart
+)
+
+#combine deg and gene_map based on ensembl ID 
+age_deg_gene_name<- age_deg %>%
+  left_join(
+    gene_map,
+    by = c("geneid" = "ensembl_gene_id")
+  )
+# write_xlsx(age_deg_gene_name, "age_deg.xlsx")
+```
+
+## GSEA age
+
+```{r}
+res<-age
+
+# Prefer the model's test statistic for ranking: t-statistic
+ranks <- res$t
+names(ranks) <- res$geneid
+ranks <- sort(ranks, decreasing = TRUE)
+
+# Sanity checks before running
+sum(duplicated(ranks))        # 1 tied values?
+sum(is.infinite(ranks))       # any Inf from p=0?
+length(ranks)                 # how many genes going in?
+
+set.seed(40)  
+gobp_gsea_age <- gseGO(
+  geneList      = ranks,
+  OrgDb         = org.Hs.eg.db,
+  ont           = "BP",
+  keyType       = "ENSEMBL",
+  minGSSize     = 15,
+  maxGSSize     = 500,
+  pvalueCutoff  = 1,
+  pAdjustMethod = "BH",
+  eps           = 0,
+  seed          = TRUE,
+  verbose       = FALSE
+)
+
+#plotting 
+df <- as.data.frame(gobp_gsea_age)
+
+n_show <- 4
+plot_df <- df %>%
+  arrange(desc(NES)) %>%
+  slice_head(n = n_show) %>%
+  bind_rows(df %>% arrange(NES) %>% slice_head(n = n_show)) %>%
+  mutate(Description = fct_reorder(Description, NES)) %>%
+  mutate(fill_group = case_when(
+    NES > 0 & p.adjust <= 0.05 ~ "Up_sig",
+    NES > 0 & p.adjust > 0.05 ~ "Up_ns",
+    NES < 0 & p.adjust <= 0.05 ~ "Down_sig",
+    TRUE ~ "Down_ns"
+  )) 
+
+
+pdf("age_GSEA_pub.pdf", width=12, height=6)
+
+ggplot(plot_df, aes(x = NES, y = Description, fill = fill_group)) +
+  geom_col(width = 0.85) +
+  scale_fill_manual(values = c(
+  "Up_sig"   = "#E4ADA9",
+  "Up_ns"    = "#abd9e9",
+  "Down_sig" = "#8EA604",
+  "Down_ns"  = "#fdae61"
+  ))+
+  geom_vline(xintercept = 0) +
+  labs(x = "Normalized Enrichment Score", y = NULL, fill = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top", panel.grid.major.y = element_blank())
+
+dev.off()
+
+```
+## leading edge genes
+
+```{r}
+gsea_res <- as.data.frame(gobp_gsea_age)
+
+# Top 4 positive and top 4 negative pathways
+top_pathways <- bind_rows(
+  gsea_res %>%
+    filter(NES > 0) %>%
+    arrange(desc(NES)) %>%
+    slice_head(n = 4),
+
+  gsea_res %>%
+    filter(NES < 0) %>%
+    arrange(NES) %>%
+    slice_head(n = 4)
+)
+
+# Create a 2-column data frame
+leading_edge_df <- top_pathways %>%
+  rowwise() %>%
+  mutate(
+    Leading_edge_genes = {
+      ensembl <- unlist(strsplit(core_enrichment, "/"))
+      symbols <- mapIds(
+        org.Hs.eg.db,
+        keys = ensembl,
+        keytype = "ENSEMBL",
+        column = "SYMBOL",
+        multiVals = "first"
+      )
+      paste(na.omit(symbols), collapse = ", ")
+    }
+  ) %>%
+  ungroup() %>%
+  dplyr::select(
+    Pathway = Description,
+    Leading_edge_genes
+  )
+
+View(leading_edge_df)
+
+# write.csv(leading_edge_df, "leg_age.csv", row.names = FALSE)
+```
+# Sensitivity Analysis 
+
+```{r}
+####### lumbar vs cervical #######
+setwd("/Users/cindywang/Desktop/Kramer/Publication/Data")
+sens_lumcerv<-read.csv("sens_cervlum(refCerv).csv") %>%
+  as.data.frame()
+
+# #add pre-count sig genes on top of plot 
+sens_lumcerv$case<-as.factor(sens_lumcerv$case)
+count_lumcerv<-sens_lumcerv %>% dplyr::count(case)
+annot_df<-count_lumcerv %>%
+  mutate(
+    x=case_when(
+      case=="A"~0.5,
+      case=="B"~1.5,
+      case=="C"~-0.5,
+      case=="D"~-1.5),
+    y = max(-log10(sens_lumcerv$p_value)) * 1.1
+  )
+
+#highlight 
+genes_to_label <- c(cerv_hox_ensembl,lum_hox_ensembl) # HOX genes
+highlight_df <- sens_lumcerv %>%
+  filter(geneid %in% genes_to_label) %>%
+  left_join(
+    gene_map,
+    by = c("geneid" = "ensembl_gene_id")
+  )
+
+##p value
+ggplot(data = sens_lumcerv, aes(x = log_fc, y = -log10(p_value))) + 
+  geom_point(aes(color = case), size = 0.8) +
+  scale_colour_manual(
+    values = c(
+     "A" = "#92c5de",
+      "B" = "blue",
+      "C"="#fdae61",
+      "D"="#ca0020",
+      "E" = "gray"
+    )
+  ) +
+  theme_classic() +
+  theme(axis.text = element_text(colour = "black")) +
+  guides(colour = "none") +
+  labs(
+    y = expression(-log[10]~P),
+    x = expression(log[2]~fold~change),
+    subtitle = "36 Cervical vs 33 Lumbar"
+  )+
+  theme(axis.title = element_text(size=15),
+        axis.text = element_text(size = 15),
+        legend.title = element_text(size = 20),
+        legend.text  = element_text(size = 20),
+        title = element_text(size=20),
+        plot.subtitle = element_text(size=20,hjust = 0.5)
+        )+
+  geom_text_repel(
+    data = highlight_df,
+    aes(label = hgnc_symbol),
+    size = 5,
+    fontface = "bold",
+    color = "black",
+    segment.color = "black",
+    segment.size = 0.8,
+    min.segment.length = 0,
+    box.padding = 0.4,
+    point.padding = 0.3
+  )+
+  xlim(-4,4.5)+
+  geom_text(
+    data = annot_df,
+    aes(x = x, y = y, label = n, color = case),
+    size = 6,
+    fontface = "bold",
+    show.legend = FALSE
+  )
+# ggsave("sens_cervlum_pub.png",width=6,height=6,unit="in",dpi = 300)
+
+
+####### Cervical vs thoracic #######
+setwd("/Users/cindywang/Desktop/Kramer/Publication/Data")
+sens_cervthor<-read.csv("sens_cervthor(refCerv).csv") %>%
+  as.data.frame()
+
+#add pre-count sig genes on top of plot 
+sens_cervthor$case<-as.factor(sens_cervthor$case)
+count_cervthor<-sens_cervthor %>% dplyr::count(case)
+annot_df<-count_cervthor %>%
+  mutate(
+    x=case_when(
+      case=="A"~0.5,
+      case=="B"~1.5,
+      case=="C"~-0.5,
+      case=="D"~-1.5),
+    y = 15
+  )
+
+genes_to_label <- c(cerv_hox_ensembl,thor_hox_ensembl)
+highlight_df <- sens_cervthor %>% 
+  filter(geneid %in% genes_to_label) %>%
+  left_join(
+    gene_map,
+    by = c("geneid" = "ensembl_gene_id")
+  )
+
+##p value 
+ggplot(data = sens_cervthor, aes(x = log_fc, y = -log10(p_value))) + 
+  geom_point(aes(color = case), size = 0.8) +
+  scale_colour_manual(
+    values = c(
+      "A" = "#92c5de",
+      "B" = "blue",
+      "C"="#fdae61",
+      "D"="#ca0020",
+      "E" = "gray"
+    )
+  ) +
+  theme_classic() +
+  theme(axis.text = element_text(colour = "black")) +
+  guides(colour = "none") +
+  labs(
+    y = expression(-log[10]~P),
+    x = expression(log[2]~fold~change),
+    subtitle = "36 Cervical vs 11 Thoracic"
+  )+
+  theme(axis.title = element_text(size=15),
+        axis.text = element_text(size = 15),
+        legend.title = element_text(size = 20),
+        legend.text  = element_text(size = 20),
+        title = element_text(size=20),
+        plot.subtitle = element_text(size=20,hjust = 0.5)
+        )+
+  xlim(-4,4.5)+
+  geom_text_repel(
+    data = highlight_df,
+    aes(label = hgnc_symbol),
+    size = 5,
+    fontface = "bold",
+    color = "black",
+    segment.color = "black",
+    segment.size = 0.8,
+    min.segment.length = 0,
+    box.padding = 0.4,
+    point.padding = 0.3
+  )+
+  geom_text(
+    data = annot_df,
+    aes(x = x, y = y, label = n, color = case),
+    size = 6,
+    fontface = "bold",
+    show.legend = FALSE
+  )
+# ggsave("sens_cervthora.png",width=6,height=6,unit="in",dpi = 300)
+
+
+######## thoracic & lumbar
+setwd("/Users/cindywang/Desktop/Kramer/Publication/Data")
+sens_thorlum<-read.csv("sens_thorlum(refThor).csv")%>%
+  as.data.frame()
+
+#add pre-count sig genes on top of plot 
+sens_thorlum$case<-as.factor(sens_thorlum$case)
+count_thorlum<-sens_thorlum %>% dplyr::count(case)
+annot_df<-count_thorlum %>%
+  mutate(
+    x=case_when(
+      case=="A"~0.5,
+      case=="B"~1.5,
+      case=="C"~-0.5,
+      case=="D"~-1.5),
+    y = 15
+  )
+
+# highlight 
+genes_to_label <- c(lum_hox_ensembl,thor_hox_ensembl) # HOX genes
+highlight_df <- sens_thorlum %>% 
+  filter(geneid %in% genes_to_label) %>%
+  left_join(
+    gene_map,
+    by = c("geneid" = "ensembl_gene_id")
+  )
+
+#plot 
+ggplot(data = sens_thorlum, aes(x = log_fc, y = -log10(p_value))) + 
+  geom_point(aes(color = case), size = 0.8) +
+  scale_colour_manual(
+    values = c(
+      "A" = "#92c5de",
+      "B" = "blue",
+      "C"="#fdae61",
+      "D"="#ca0020",
+      "E" = "gray"
+    )
+  ) +
+  theme_classic() +
+  theme(axis.text = element_text(colour = "black")) +
+  guides(colour = "none") +
+  labs(
+    y = expression(-log[10]~P),
+    x = expression(log[2]~fold~change),
+    subtitle = "11 Thoracic vs 33 Lumbar"
+  )+
+  theme(axis.title = element_text(size=15),
+        axis.text = element_text(size = 15),
+        legend.title = element_text(size = 20),
+        legend.text  = element_text(size = 20),
+        title = element_text(size=20),
+        plot.subtitle = element_text(size=20,hjust = 0.5)
+        )+
+  xlim(-4,4.5)+
+  geom_text_repel(
+    data = highlight_df,
+    aes(label = hgnc_symbol),
+    size = 5,
+    fontface = "bold",
+    color = "black",
+    segment.color = "black",
+    segment.size = 0.8,
+    min.segment.length = 0,
+    box.padding = 0.4,
+    point.padding = 0.3
+  )+
+  ylim(0,15)+
+  geom_text(
+    data = annot_df,
+    aes(x = x, y = y, label = n, color = case),
+    size = 6,
+    fontface = "bold",
+    show.legend = FALSE
+  )
+# ggsave("sens_thorlum.png",width=6,height=6,unit="in",dpi = 300)
+ 
+```
+# Concordance analysis 
+1. find DEGs from main analysis
+2. match those DEGs to sens analysis (n=?)
+3. find correlation, t, df, p value
+4. color by concordance
+
+```{r}
+###########################################
+############ cervival thoracic ############
+###########################################
+
+# Keep overlapping genes and relevant columns
+cervthor_df <- cervthor %>%
+  dplyr::select(geneid, log_fc_main = log_fc, case_main = case) %>%
+  inner_join(
+    sens_cervthor%>%
+      dplyr::select(geneid, log_fc_sens = log_fc, case_sens = case),
+    by = "geneid"
+  ) %>%
+  mutate(
+    concordance = case_when(
+      case_sens %in% c("A", "B") &
+        case_main %in% c("A", "B")        ~ "Upregulated",
+      case_sens %in% c("C", "D") &
+        case_main %in% c("C", "D")        ~ "Downregulated",
+      case_sens == "E" | case_main == "E" ~ "NS",
+      TRUE ~ "Discordant"
+    )
+  )
+
+# Pearson correlation test
+cor_result <- cor.test(
+  cervthor_df$log_fc_sens,
+  cervthor_df$log_fc_main,
+  method = "pearson"
+)
+
+# Extract statistics
+cor_stats <- data.frame(
+  n = nrow(cervthor_df),
+  correlation = unname(cor_result$estimate),
+  t_value = unname(cor_result$statistic),
+  df = unname(cor_result$parameter),
+  p_value = cor_result$p.value
+)
+cor_stats
+
+# plot and color by concordance 
+annotation <- sprintf(
+  "Pearson r = %.3f",
+  cor_stats$correlation
+)
+
+ggplot(
+  cervthor_df,
+  aes(
+    x = log_fc_main,
+    y = log_fc_sens,
+    color = concordance
+  )
+) +
+  geom_hline(yintercept = 0, color = "grey80", linewidth = 0.4) +
+  geom_vline(xintercept = 0, color = "grey80", linewidth = 0.4) +
+  geom_point(
+    data = cervthor_df %>%
+      filter(!concordance %in% c("Upregulated", "Downregulated")),
+    color = "grey70",
+    size = 2,
+    alpha = 0.6
+  ) +
+  geom_point(
+    data = cervthor_df %>%
+      filter(concordance %in% c("Upregulated", "Downregulated")),
+    aes(color = concordance),
+    size = 2,
+    alpha = 0.9
+  ) +
+  annotate(
+    "text",
+    x = -Inf, y = Inf,
+    label = annotation,
+    hjust = -0.05, vjust = 1.1,
+    size = 4
+  ) +
+  scale_color_manual(
+    values = c(
+      "Upregulated"   = "#D73027",
+      "Downregulated"   = "#2166AC",
+      "Discordant" ="darkgreen",
+      "NS" = "grey65"),
+  breaks = c("Upregulated", "Downregulated","Discordant")
+  ) +
+  labs(
+  x = expression(log[2]~"[fold change, main analysis]"),
+  y = expression(log[2]~"[fold change, sensitivity analysis]"),
+  subtitle = "Cervical vs. Thoracic",
+  color = "Concordance"
+  ) +  
+  ylim(-2,2.5)+
+  theme_classic(base_size = 13)
+ggsave("concordance_cervthor.png",width=8,height=6,unit="in",dpi = 300)
+
+###########################################
+############ cervival lumbar ############
+###########################################
+# Keep overlapping genes and relevant columns
+lumcerv_df <- lumcerv %>%
+  dplyr::select(geneid, log_fc_main = log_fc, case_main = case) %>%
+  inner_join(
+    sens_lumcerv%>%
+      dplyr::select(geneid, log_fc_sens = log_fc, case_sens = case),
+    by = "geneid"
+  ) %>%
+  mutate(
+    concordance = case_when(
+      case_sens %in% c("A", "B") &
+        case_main %in% c("A", "B")        ~ "Upregulated",
+      case_sens %in% c("C", "D") &
+        case_main %in% c("C", "D")        ~ "Downregulated",
+      case_sens == "E" | case_main == "E" ~ "NS",
+      TRUE ~ "Discordant"
+    )
+  )
+
+# Pearson correlation test
+cor_result <- cor.test(
+  lumcerv_df$log_fc_sens,
+  lumcerv_df$log_fc_main,
+  method = "pearson"
+)
+
+# Extract statistics
+cor_stats <- data.frame(
+  n = nrow(lumcerv_df),
+  correlation = unname(cor_result$estimate),
+  t_value = unname(cor_result$statistic),
+  df = unname(cor_result$parameter),
+  p_value = cor_result$p.value
+)
+cor_stats
+
+# plot and color by concordance 
+annotation <- sprintf(
+  "Pearson r = %.3f",
+  cor_stats$correlation
+)
+
+ggplot(
+  lumcerv_df,
+  aes(
+    x = log_fc_main,
+    y = log_fc_sens,
+    color = concordance
+  )
+) +
+  geom_hline(yintercept = 0, color = "grey80", linewidth = 0.4) +
+  geom_vline(xintercept = 0, color = "grey80", linewidth = 0.4) +
+  geom_point(
+    data = lumcerv_df %>%
+      filter(!concordance %in% c("Upregulated", "Downregulated")),
+    color = "grey70",
+    size = 2,
+    alpha = 0.6
+  ) +
+  geom_point(
+    data = lumcerv_df %>%
+      filter(concordance %in% c("Upregulated", "Downregulated")),
+    aes(color = concordance),
+    size = 2,
+    alpha = 0.9
+  ) +
+  annotate(
+    "text",
+    x = -Inf, y = Inf,
+    label = annotation,
+    hjust = -0.05, vjust = 1.1,
+    size = 4
+  ) +
+  scale_color_manual(
+    values = c(
+      "Upregulated"   = "#D73027",
+      "Downregulated"   = "#2166AC",
+      "Discordant" ="darkgreen",
+      "NS" = "grey65"),
+  breaks = c("Upregulated", "Downregulated","Discordant")
+  ) +
+  labs(
+  x = expression(log[2]~"[fold change, main analysis]"),
+  y = expression(log[2]~"[fold change, sensitivity analysis]"),
+  subtitle = "Cervical vs. Lumbar",
+  color = "Concordance"
+  ) +
+  ylim(-2,2.5)+
+  theme_classic(base_size = 13)
+ggsave("concordance_cervlum.png",width=8,height=6,unit="in",dpi = 300)
+
+
+###########################################
+############ thoracic lumbar ############
+###########################################
+# Keep overlapping genes and relevant columns
+thorlum_df <- thorlum %>%
+  dplyr::select(geneid, log_fc_main = log_fc, case_main = case) %>%
+  inner_join(
+    sens_thorlum %>%
+      dplyr::select(geneid, log_fc_sens = log_fc, case_sens = case),
+    by = "geneid"
+  ) %>%
+  mutate(
+    concordance = case_when(
+      case_sens %in% c("A", "B") &
+        case_main %in% c("A", "B")        ~ "Upregulated",
+      case_sens %in% c("C", "D") &
+        case_main %in% c("C", "D")        ~ "Downregulated",
+      case_sens == "E" | case_main == "E" ~ "NS",
+      TRUE ~ "Discordant"
+    )
+  )
+
+# Pearson correlation test
+cor_result <- cor.test(
+  thorlum_df$log_fc_sens,
+  thorlum_df$log_fc_main,
+  method = "pearson"
+)
+
+# Extract statistics
+cor_stats <- data.frame(
+  n = nrow(thorlum_df),
+  correlation = unname(cor_result$estimate),
+  t_value = unname(cor_result$statistic),
+  df = unname(cor_result$parameter),
+  p_value = cor_result$p.value
+)
+cor_stats
+
+# plot and color by concordance 
+annotation <- sprintf(
+  "Pearson r = %.3f",
+  cor_stats$correlation
+)
+
+ggplot(
+  thorlum_df,
+  aes(
+    x = log_fc_main,
+    y = log_fc_sens,
+    color = concordance
+  )
+) +
+  geom_hline(yintercept = 0, color = "grey80", linewidth = 0.4) +
+  geom_vline(xintercept = 0, color = "grey80", linewidth = 0.4) +
+  geom_point(
+    data = thorlum_df %>%
+      filter(!concordance %in% c("Upregulated", "Downregulated")),
+    color = "grey70",
+    size = 2,
+    alpha = 0.6
+  ) +
+  geom_point(
+    data = thorlum_df %>%
+      filter(concordance %in% c("Upregulated", "Downregulated")),
+    aes(color = concordance),
+    size = 2,
+    alpha = 0.9
+  ) +
+  annotate(
+    "text",
+    x = -Inf, y = Inf,
+    label = annotation,
+    hjust = -0.05, vjust = 1.1,
+    size = 4
+  ) +
+  scale_color_manual(
+    values = c(
+      "Upregulated"   = "#D73027",
+      "Downregulated"   = "#2166AC",
+      "Discordant" ="darkgreen",
+      "NS" = "grey65"),
+  breaks = c("Upregulated", "Downregulated","Discordant")
+  ) +
+  labs(
+  x = expression(log[2]~"[fold change, main analysis]"),
+  y = expression(log[2]~"[fold change, sensitivity analysis]"),
+  subtitle = "Thoracic vs. Lumbar",
+  color = "Concordance"
+  ) +
+  ylim(-2,2.5)+
+  theme_classic(base_size = 13)
+ggsave("concordance_thorlum.png",width=8,height=6,unit="in",dpi = 300)
+
+
+```

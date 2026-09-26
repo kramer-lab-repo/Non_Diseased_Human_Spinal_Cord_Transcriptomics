@@ -1,0 +1,173 @@
+---
+title: "RNA deconv"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(here)
+library(Seurat)
+library(data.table)
+library(tidyverse)
+library(Matrix)
+```
+
+## R Markdown
+
+
+```{r cars}
+counts<-read.csv("counts.csv.gz")
+colnames(counts)<-gsub("\\.","-",colnames(counts))
+counts<-counts %>% column_to_rownames("X")
+dim(counts) #22238 55289
+head(counts)[1:5]
+
+dt<-read.csv("meta.csv.gz")
+dt<-dt %>% column_to_rownames("X")
+dim(dt) #55289     6
+
+all(rownames(dt)==colnames(counts))
+```
+
+## signature matrix - seurat
+
+```{r pressure, echo=FALSE}
+options(future.globals.maxSize=16000*1024^3)
+
+robj<-CreateSeuratObject(counts=as.matrix(counts),
+                         meta.data=dt)
+Idents(robj)<-robj$sample 
+
+```
+
+##qc
+
+```{r}
+#filter 
+robj<-subset(robj,subset=nFeature_RNA>200 & nFeature_RNA<7500& percent.mt<5)
+Idents(robj)<-factor(
+  Idents(robj),
+  levels = sort(as.numeric(levels(Idents(robj))))
+)
+b<-VlnPlot(robj,features = c("nFeature_RNA","nCount_RNA","percent.mt"),ncol=3,alpha=0.3)
+b
+ggsave("vlnplot_filtered.pdf",plot=b, width=10,height = 8,units = "in",dpi=300)
+```
+
+#Downsample for donor 4 
+
+```{r}
+set.seed(123)
+
+donor4_cells <- colnames(robj)[robj$sample == "4"]
+other_cells  <- colnames(robj)[robj$sample != "4"]
+
+donor4_keep <- sample(donor4_cells, 6000)
+
+robj <- subset(robj, cells = c(other_cells, donor4_keep))
+
+table(robj$sample)
+
+#plot 
+# ggplot(data.frame(sample=robj$sample),aes(x=sample))+
+#   geom_bar()+
+#   labs(x="Donor",y="Nuclei Count")+
+#   theme_bw()+
+#   theme(
+#     axis.text.y = element_text(size=14),
+#     axis.title.y = element_text(size=14),
+#     axis.text.x = element_text(size=14,hjust=1),
+#     axis.title.x = element_text(size=14)
+#   )+
+#   scale_x_discrete(limits=c("1","2","3","4","5","6","7"))
+# ggsave("Nuclei_per_donor1.pdf",width=10,height = 6,units = "in",dpi=300)
+```
+
+#group subtypes 
+
+```{r}
+dt$mid_level<-dt$subtype_annotation
+dt<-dt %>%
+  mutate(mid_level=case_when(
+    grepl("^Ex-Dorsal-",mid_level)~"Exci_Neuron",
+    grepl("^Ex-M-",mid_level)~"Exci_Neuron",
+    grepl("^Ex-V-",mid_level)~"Exci_Neuron",
+    grepl("^Inh-Dorsal-",mid_level)~"Inh_Neuron",
+    grepl("^Inh-M-",mid_level)~"Inh_Neuron",
+    grepl("^Inh-V-",mid_level)~"Inh_Neuron",
+    grepl("^Meninges-",mid_level)~"Meninges",
+    grepl("Microglia",mid_level)~"Microglia",
+    grepl("Oligo",mid_level)~"Oligodendrocyte",
+    grepl("^Schwann-",mid_level)~"Schwann",
+    grepl("Astrocytes",mid_level)~"Astrocyte",
+    grepl("Endothelial",mid_level)~"Endothelial",
+    TRUE       ~mid_level
+  ))
+
+dt<-dt%>%
+  mutate(mid_level=case_when(
+    grepl("OPC|Oligodendrocyte",mid_level,ignore.case = TRUE)~"Oligodendrocyte",
+    grepl("^Ependymal",mid_level,ignore.case = TRUE)~"Other",
+    grepl("^IEG",mid_level,ignore.case = TRUE)~"Other",
+    grepl("(^|/|_)SM($|/|_)",mid_level,ignore.case = TRUE)~"Other",
+    TRUE ~mid_level
+  ))
+
+table(dt$mid_level)
+
+```
+
+
+## Subsample for each cell type
+Downsampling to 1000 cells per cell type at mid level
+
+```{r}
+# Add mid_level back to the Seurat object
+robj$mid_level <- dt[colnames(robj), "mid_level"]
+
+# downsample
+set.seed(789)
+Idents(robj)<-robj$mid_level
+robj_sub <- subset(x = robj, downsample = 1000)
+
+table(robj_sub@active.ident)
+
+table(robj@active.ident)
+
+#plot 
+ggplot(data.frame(cell_type=robj@active.ident),aes(x=cell_type))+
+  geom_bar()+
+  labs(x="Cell Type",y="Nuclei Count")+
+  theme_bw()+
+  theme(
+    axis.text.y = element_text(size=14),
+    axis.title.y = element_text(size=14),
+    axis.text.x = element_text(size=14,hjust=1,angle=45),
+    axis.title.x = element_text(size=14)
+  )
+ggsave("Nuclei_per_celltype.pdf",width=10,height = 6,units = "in",dpi=300)
+
+```
+## replace cell ID with cell type
+
+```{r}
+#get counts matrix (genes x cells)
+counts_mat<-GetAssayData(robj_sub,layer = "counts")
+
+#get cell type for each cell 
+#make sure order matches columns of counts_mat
+cell_types<-robj_sub$mid_level[colnames(counts_mat)]
+
+#build a data frame with cell types as first row, remaining rows as gene counts 
+df_out<-rbind(celltype=cell_types,
+              as.data.frame(counts_mat))
+
+colnames(df_out)<-NULL
+dim(df_out)
+
+# write.table(df_out,
+#             file="CIBERSORTX_sn_reference_midlevel_filtered.txt",
+#             sep="\t",
+#             quote=FALSE,
+#             col.names=NA)
+```
+

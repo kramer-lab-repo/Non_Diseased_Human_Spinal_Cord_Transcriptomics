@@ -1,0 +1,423 @@
+---
+title: "DREAM HPC"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(data.table)
+library(dplyr)
+library(ggrepel)
+library(ggplot2)
+library(readr)
+library(stringr)
+library(tidyr)
+library(devtools)
+library(tidyverse)
+library(edgeR)
+library(limma)
+library(variancePartition)
+library(BiocParallel)
+```
+
+# load data 
+
+```{r}
+setwd("C:/Users/kramerlab/Downloads")
+
+all3_merged<-read.csv("merge_counts_ensembl.csv",row.names = 1)%>%
+  column_to_rownames("Ensembl")
+
+dim(all3_merged)
+```
+
+# data cleanup
+
+```{r}
+all3_meta<-read.csv("merge_meta.csv") %>%
+  column_to_rownames("sample")
+
+all3_meta<-all3_meta%>%
+  mutate(
+    across(c(source,level,sex,site),as.factor),
+    across(c(age),as.numeric)
+  )
+
+colnames(all3_merged)<-gsub("\\.","-",colnames(all3_merged))
+all3_meta<-all3_meta[match(colnames(all3_merged),rownames(all3_meta)),]
+all(colnames(all3_merged)==rownames(all3_meta))
+
+#cpm filter 
+cpm<-cpm(all3_merged)
+cpm_df<-as.data.frame(cpm)
+
+#drop gene if CPM is missing in 80% or greater of participants 
+sampleNumber<-ncol(cpm_df)
+keep=rowSums(cpm_df>0)>=sampleNumber*0.2
+all3_merged<-cpm_df[keep,]
+dim(all3_merged) #33197   249
+
+```
+
+#dream (sex)
+
+```{r}
+levels(all3_meta$sex)
+
+library(parallel)
+
+param<-SnowParam(workers=20,type = "SOCK")
+
+all3_meta$sex<-factor(all3_meta$sex,levels=c("Female","Male"))
+# Assume dge is a DGEList with norm factors, as before
+dge<-DGEList(counts=all3_merged)
+dge<-calcNormFactors(dge)
+
+form <- ~ source + sex + age + level + (1|donor)     # mixed model formula
+
+vobj <- voomWithDreamWeights(dge, form, all3_meta, BPPARAM=param) 
+fit <- dream(vobj, form, all3_meta, BPPARAM=param)                                 
+fit <- eBayes(fit)                                              
+
+########## sex ##########  
+res <- topTable(
+  fit,
+  coef = "sexMale",  # sexMale: logFC = male vs female
+  number = Inf,
+  adjust.method = "BH"
+) %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "geneid") %>%
+  janitor::clean_names() %>%
+  as_tibble() %>%
+  arrange(adj_p_val)
+nrow(res) #33197
+
+#remove sex chromosome genes 
+# library(biomaRt)
+# mart<-useEnsembl(
+#   biomart = "genes",
+#   dataset = "hsapiens_gene_ensembl"
+# )
+# 
+# sex_chr_df<-getBM(
+#   attributes = c(
+#     "ensembl_gene_id",
+#     "hgnc_symbol",
+#     "chromosome_name"
+#   ),
+#   filters="chromosome_name",
+#   values=c("X","Y"),
+#   mart = mart
+# )
+# 
+# sex_chr_df<-subset(sex_chr_df,ensembl_gene_id!="")
+# sex_genes<-unique(sex_chr_df$ensembl_gene_id)
+# 
+# sex_chr_genes_df<-data.frame(
+#   gene_name=sex_genes,
+#   stringsAsFactors = FALSE
+# )
+# ####remove sex chromosome genes
+# res<-res[!res$geneid %in% sex_chr_genes_df$gene_name,]
+# nrow(res) #32040
+
+########## FC threshold: 1.5
+res_volcano <- res %>%
+  mutate(case = case_when(
+    adj_p_val < 0.05 & log_fc >= 0 & log_fc <1             ~ "A",  # higher in male
+    adj_p_val < 0.05 & log_fc >= 1          ~ "B",
+    adj_p_val < 0.05 & log_fc <= 0 & log_fc >-1                       ~ "C",  # higher in female
+    adj_p_val < 0.05 & log_fc <= -1           ~ "D",
+    TRUE                                        ~ "E"   # not significant
+  )) 
+write.csv(res_volcano,"sex(inc_sex_linked)_ENSEMBL.csv", row.names = TRUE)
+
+##p value 
+ggplot(data = res_volcano, aes(x = log_fc, y = -log10(p_value))) + 
+  geom_point(aes(color = case), size = 2) +
+  scale_colour_manual(
+    values = c(
+      "A" = "lightskyblue",
+      "B" = "midnightblue",
+      "C"="orange",
+      "D"="red",
+      "E" = "gray"
+    )
+  ) +
+  theme_bw() +
+  theme(axis.text = element_text(colour = "black")) +
+  guides(colour = "none") +
+  labs(
+    y = expression(-log[10]~P),
+    x = expression(log[2]~fold~change),
+    title = "Combined Volcano Plot",
+    subtitle = "Female vs Male"
+  )
+
+# ggsave("Combined_DREAM_sex.png",width=10,height=6,unit="in",dpi = 300)
+
+```
+
+#dream (level)
+
+```{r}
+all3_meta$level<-factor(
+  all3_meta$level,
+  levels = c("Cervical_Spinal_Cord","Thoracic_Spinal_Cord","Lumbar_Spinal_Cord")
+)
+
+levels(all3_meta$level)
+
+########## lumbar & cervical ##########  
+res <- topTable(
+  fit,
+  coef = "levelLumbar_Spinal_Cord",  # sexMale: logFC = = lumbar vs cervical
+  number = Inf,
+  adjust.method = "BH"
+) %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "geneid") %>%
+  janitor::clean_names() %>%
+  as_tibble() %>%
+  arrange(adj_p_val)
+
+
+#top 10 genes with smallest p values 
+head(res, 10) %>% gt::gt()
+
+########## FC threshold: 1.5
+res_volcano <- res %>%
+  mutate(case = case_when(
+    adj_p_val < 0.05 & log_fc >= 0 & log_fc <1             ~ "A",  # higher in male
+    adj_p_val < 0.05 & log_fc >= 1          ~ "B",
+    adj_p_val < 0.05 & log_fc <= 0 & log_fc >-1                       ~ "C",  # higher in female
+    adj_p_val < 0.05 & log_fc <= -1           ~ "D",
+    TRUE                                        ~ "E"   # not significant
+  )) 
+write.csv(res_volcano, "cerv_lumb(refCerv)_ENSEMBL.csv", row.names = TRUE)
+# table(res_volcano$case)
+##p value 
+ggplot(data = res_volcano, aes(x = log_fc, y = -log10(p_value))) + 
+  geom_point(aes(color = case), size = 2) +
+  scale_colour_manual(
+    values = c(
+      "A" = "lightskyblue",
+      "B" = "midnightblue",
+      "C"="orange",
+      "D"="red",
+      "E" = "gray"
+    )
+  ) +
+  theme_bw() +
+  theme(axis.text = element_text(colour = "black")) +
+  guides(colour = "none") +
+  labs(
+    y = expression(-log[10]~P),
+    x = expression(log[2]~fold~change),
+    title = "Combined Volcano Plot",
+    subtitle = "Cervical vs Lumbar"
+  )+
+  ylim(0,12)+
+  xlim(-4,4)
+
+# ggsave("Combined_DREAM_cervlum.png",width=6,height=6,unit="in",dpi = 300)
+
+####### Cervical vs thoracic #######
+res <- topTable(
+  fit,
+  coef = "levelThoracic_Spinal_Cord",  # sexMale: logFC = = lumbar vs thoracic
+  number = Inf,
+  adjust.method = "BH"
+) %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "geneid") %>%
+  janitor::clean_names() %>%
+  as_tibble() %>%
+  arrange(adj_p_val)
+
+
+#top 10 genes with smallest p values 
+head(res, 10) %>% gt::gt()
+
+########## FC threshold: 1.5
+res_volcano <- res %>%
+  mutate(case = case_when(
+    adj_p_val < 0.05 & log_fc >= 0 & log_fc <1             ~ "A",  # higher in male
+    adj_p_val < 0.05 & log_fc >= 1          ~ "B",
+    adj_p_val < 0.05 & log_fc <= 0 & log_fc >-1                       ~ "C",  # higher in female
+    adj_p_val < 0.05 & log_fc <= -1           ~ "D",
+    TRUE                                        ~ "E"   # not significant
+  )) 
+write.csv(res_volcano, "cerv_thor(refCerv)_ENSEMBL.csv", row.names = TRUE)
+# table(res_volcano$case)
+
+##p value 
+ggplot(data = res_volcano, aes(x = log_fc, y = -log10(p_value))) + 
+  geom_point(aes(color = case), size = 2) +
+  scale_colour_manual(
+    values = c(
+      "A" = "lightskyblue",
+      "B" = "midnightblue",
+      "C"="orange",
+      "D"="red",
+      "E" = "gray"
+    )
+  ) +
+  theme_bw() +
+  theme(axis.text = element_text(colour = "black")) +
+  guides(colour = "none") +
+  labs(
+    y = expression(-log[10]~P),
+    x = expression(log[2]~fold~change),
+    title = "Combined Volcano Plot",
+    subtitle = "Cervical vs Thoracic"
+  )+
+  ylim(0,12)+
+  xlim(-3.5,3.5)
+
+# ggsave("Combined_DREAM_thorcervical.png",width=6,height=6,unit="in",dpi = 300)
+
+
+
+
+######## lumbar & thoracic
+all3_meta$level<-factor(
+  all3_meta$level,
+  levels = c("Thoracic_Spinal_Cord","Lumbar_Spinal_Cord","Cervical_Spinal_Cord")
+)
+
+levels(all3_meta$level)
+
+param<-SnowParam(workers=20,type = "SOCK")
+
+# Assume dge is a DGEList with norm factors, as before
+dge<-DGEList(counts=all3_merged)
+dge<-calcNormFactors(dge)
+
+form <- ~ source + sex + age + level + (1|donor)     # mixed model formula
+
+vobj <- voomWithDreamWeights(dge, form, all3_meta, BPPARAM=param) 
+fit <- dream(vobj, form, all3_meta, BPPARAM=param)                                 
+fit <- eBayes(fit)                                                 
+
+########## cervical & thoracic ##########  
+res <- topTable(
+  fit,
+  coef = "levelLumbar_Spinal_Cord",  # sexMale: logFC = = lumbar vs cervical
+  number = Inf,
+  adjust.method = "BH"
+) %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "geneid") %>%
+  janitor::clean_names() %>%
+  as_tibble() %>%
+  arrange(adj_p_val)
+
+
+#top 10 genes with smallest p values 
+head(res, 10) %>% gt::gt()
+
+########## FC threshold: 1.5
+res_volcano <- res %>%
+  mutate(case = case_when(
+    adj_p_val < 0.05 & log_fc >= 0 & log_fc <1             ~ "A",  # higher in male
+    adj_p_val < 0.05 & log_fc >= 1          ~ "B",
+    adj_p_val < 0.05 & log_fc <= 0 & log_fc >-1                       ~ "C",  # higher in female
+    adj_p_val < 0.05 & log_fc <= -1           ~ "D",
+    TRUE                                        ~ "E"   # not significant
+  )) 
+
+
+write.csv(res_volcano, "thor_lum(refThor)_ENSEMBL.csv", row.names = TRUE)
+
+##p value 
+ggplot(data = res_volcano, aes(x = log_fc, y = -log10(p_value))) + 
+  geom_point(aes(color = case), size = 2) +
+  scale_colour_manual(
+    values = c(
+      "A" = "lightskyblue",
+      "B" = "midnightblue",
+      "C"="orange",
+      "D"="red",
+      "E" = "gray"
+    )
+  ) +
+  theme_bw() +
+  theme(axis.text = element_text(colour = "black")) +
+  guides(colour = "none") +
+  labs(
+    y = expression(-log[10]~P),
+    x = expression(log[2]~fold~change),
+    title = "Combined Volcano Plot",
+    subtitle = " Thoracic vs Lumbar"
+  )+
+  ylim(0,12)+
+  xlim(-4,4)
+
+ggsave("Combined_DREAM_thorlum.png",width=6,height=6,unit="in",dpi = 300)
+```
+
+#dream (continuous age)
+
+```{r}
+##age continuous 
+dge<-DGEList(counts=all3_merged)
+dge<-calcNormFactors(dge)
+
+form <- ~ source + sex + age + level + (1|donor)     # mixed model formula
+
+vobj <- voomWithDreamWeights(dge, form, all3_meta, BPPARAM=param) 
+fit <- dream(vobj, form, all3_meta, BPPARAM=param)                                 
+fit <- eBayes(fit)                                                  
+
+########## sex ##########  
+res <- topTable(
+  fit,
+  coef = "age",  # sexMale: logFC = old vs young
+  number = Inf,
+  adjust.method = "BH"
+) %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "geneid") %>%
+  janitor::clean_names() %>%
+  as_tibble() %>%
+  arrange(adj_p_val)
+
+#top 10 genes with smallest p values 
+head(res, 10) %>% gt::gt()
+
+########## FC threshold: 1.5
+res_volcano <- res %>%
+  mutate(case = case_when(
+    adj_p_val < 0.05 & log_fc >= 0 & log_fc <1             ~ "A",  # higher in male
+    adj_p_val < 0.05 & log_fc >= 1          ~ "B",
+    adj_p_val < 0.05 & log_fc <= 0 & log_fc >-1                       ~ "C",  # higher in female
+    adj_p_val < 0.05 & log_fc <= -1           ~ "D",
+    TRUE                                        ~ "E"   # not significant
+  )) 
+write.csv(res_volcano, "age_cont_ENSEMBL.csv", row.names = TRUE)
+
+##p value 
+ggplot(data = res_volcano, aes(x = log_fc, y = -log10(p_value))) + 
+  geom_point(aes(color = case), size = 2) +
+  scale_colour_manual(
+    values = c(
+      "A" = "lightskyblue",
+      "B" = "midnightblue",
+      "C"="orange",
+      "D"="red",
+      "E" = "gray"
+    )
+  ) +
+  theme_bw() +
+  theme(axis.text = element_text(colour = "black")) +
+  guides(colour = "none") +
+  labs(
+    y = expression(-log[10]~P),
+    x = expression(log[2]~fold~change),
+    title = "Combined Volcano Plot",
+    subtitle = "Age (continuous)"
+  )
+
+ggsave("Combined_DREAM_age70.png",width=10,height=6,unit="in",dpi = 300)
+```
